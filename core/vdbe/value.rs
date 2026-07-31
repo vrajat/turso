@@ -1,11 +1,10 @@
-use crate::turso_assert;
 use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
-    LimboError, Result, Value, ValueRef,
+    LimboError, Result, Value,
 };
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
@@ -140,28 +139,6 @@ impl ComparisonOp {
             ComparisonOp::Le => order.is_le(),
             ComparisonOp::Gt => order.is_gt(),
             ComparisonOp::Ge => order.is_ge(),
-        }
-    }
-
-    pub(super) fn compare_nulls<V1: AsValueRef, V2: AsValueRef>(
-        &self,
-        lhs: V1,
-        rhs: V2,
-        null_eq: bool,
-    ) -> bool {
-        let (lhs, rhs) = (lhs.as_value_ref(), rhs.as_value_ref());
-        turso_assert!(matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null));
-
-        match self {
-            ComparisonOp::Eq => {
-                let both_null = lhs == rhs;
-                null_eq && both_null
-            }
-            ComparisonOp::Ne => {
-                let at_least_one_null = lhs != rhs;
-                null_eq && at_least_one_null
-            }
-            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => false,
         }
     }
 }
@@ -347,7 +324,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        let mut blob = crate::alloc::vec![0; length as usize];
+        let mut blob = crate::alloc::try_vec![0; length as usize]?;
         fill_bytes(&mut blob);
         Ok(Value::Blob(blob))
     }
@@ -939,7 +916,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        Ok(Value::Blob(crate::alloc::vec![0; length as usize]))
+        Ok(Value::Blob(crate::alloc::try_vec![0; length as usize]?))
     }
 
     // exec_if returns whether you should jump
@@ -1389,14 +1366,40 @@ impl Value {
         result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
-    /// Concatenate another value onto this Text value, converting both to strings.
-    /// Used by GROUP_CONCAT/STRING_AGG to properly handle all value types.
+    /// Fallibly concatenate another value onto this Text value, converting it to a string.
     /// Panics if self is not a Text value.
-    pub fn exec_group_concat(&mut self, other: &Value) {
+    pub fn exec_group_concat(
+        &mut self,
+        other: &Value,
+    ) -> std::result::Result<(), crate::alloc::TryReserveError> {
         let Value::Text(text) = self else {
-            panic!("concat_to_text must be called only on Value::Text");
+            panic!("group_concat accumulator must be a Text value");
         };
-        text.value.to_mut().push_str(&other.to_string());
+        let acc = match &mut text.value {
+            std::borrow::Cow::Owned(s) => s,
+            borrowed => {
+                let mut s = String::new();
+                s.try_reserve(borrowed.len())?;
+                s.push_str(borrowed);
+                *borrowed = std::borrow::Cow::Owned(s);
+                let std::borrow::Cow::Owned(s) = borrowed else {
+                    unreachable!("accumulator was just converted to Owned");
+                };
+                s
+            }
+        };
+        match other {
+            Value::Text(text) => {
+                acc.try_reserve(text.as_str().len())?;
+                acc.push_str(text.as_str());
+            }
+            other => {
+                let rendered = other.to_string();
+                acc.try_reserve(rendered.len())?;
+                acc.push_str(&rendered);
+            }
+        }
+        Ok(())
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {

@@ -23,6 +23,8 @@ pub enum Cmd {
     Explain(Stmt),
     /// `EXPLAIN QUERY PLAN` statement
     ExplainQueryPlan(Stmt),
+    /// PostgreSQL-compatible `EXPLAIN` statement
+    ExplainPostgres(Stmt),
     /// statement
     Stmt(Stmt),
 }
@@ -783,6 +785,14 @@ pub enum Literal {
     CurrentTime,
     /// `CURRENT_TIMESTAMP`
     CurrentTimestamp,
+}
+
+pub fn blob_literal_hex(blob: &str) -> &str {
+    debug_assert!(blob.len() >= 3);
+    debug_assert!(matches!(blob.as_bytes()[0], b'x' | b'X'));
+    debug_assert_eq!(blob.as_bytes()[1], b'\'');
+    debug_assert_eq!(blob.as_bytes()[blob.len() - 1], b'\'');
+    &blob[2..blob.len() - 1]
 }
 
 /// Textual comparison operator in an expression

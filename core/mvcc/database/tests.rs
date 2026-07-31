@@ -175,6 +175,38 @@ impl FailOnDemandAlloc {
     }
 }
 
+#[test]
+fn write_set_take_transfers_entries_without_cloning() {
+    let mut write_set = WriteSet::<TursoAllocator>::new();
+    let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(crate::alloc::vec![]));
+    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
+
+    assert!(write_set.insert(row_id, Arc::clone(&row_versions)));
+    let entries_ptr = write_set.entries.as_ptr();
+    let entries_capacity = write_set.entries.capacity();
+    let strong_count = Arc::strong_count(&row_versions);
+
+    let transferred = write_set.take();
+
+    assert!(write_set.entries.is_empty());
+    assert!(write_set.seen.is_empty());
+    assert_eq!(transferred.entries.as_ptr(), entries_ptr);
+    assert_eq!(transferred.entries.capacity(), entries_capacity);
+    assert_eq!(transferred.seen.len(), 1);
+    assert_eq!(Arc::strong_count(&row_versions), strong_count);
+    assert!(Arc::ptr_eq(&transferred.entries[0].1, &row_versions));
+}
+
+#[test]
+#[should_panic(expected = "write set cannot be modified unless transaction is active")]
+fn aborted_transaction_rejects_write_set_insert() {
+    let tx = new_tx(1, 1, TransactionState::Aborted);
+    let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(crate::alloc::vec![]));
+    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
+
+    tx.insert_to_write_set(row_id, row_versions);
+}
+
 unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
     fn allocate(
         &self,
@@ -5558,6 +5590,7 @@ fn test_future_row() {
 use crate::mvcc::cursor::MvccLazyCursor;
 use crate::mvcc::database::CommitYieldPoint::LogRecordPrepared;
 use crate::mvcc::database::{MvStore, Row, RowID};
+use crate::schema::IndexColumn;
 use crate::types::Text;
 use crate::Value;
 use crate::{Database, StepResult};
@@ -8646,14 +8679,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         name: "testindex".to_string(),
         table_name: "test".to_string(),
         root_page: 0,
-        columns: crate::alloc::vec![crate::schema::IndexColumn {
-            name: "id".to_string(),
-            order: turso_parser::ast::SortOrder::Asc,
-            pos_in_table: 0,
-            collation: None,
-            default: None,
-            expr: None,
-        }],
+        columns: IndexColumn::new_many(vec!["id"]),
         unique: true,
         ephemeral: false,
         has_rowid: true,
@@ -15731,6 +15757,64 @@ fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
     assert!(objects.iter().any(|object| object.name == "secret_items"));
 }
 
+/// After a checkpoint, log records reference tables by the canonical
+/// -(root_page) id, but `table_id_to_rootpage` keeps entries keyed by the
+/// original in-memory counter ids. Root pages drift away from the
+/// -(counter id) alignment as `sqlite_schema` page splits interleave with
+/// btree creation (the fat multi-column DDL below forces those splits), so a
+/// canonical id aliases the still-live counter-id entry of an unrelated
+/// object (typically an autoindex). Resolving portable object-map names
+/// through the map first then followed the wrong root page, failing the
+/// commit with "portable changes cannot resolve user data table id ...".
+/// Post-checkpoint inserts must resolve every table to its own name.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_checkpointed_table_despite_counter_id_alias() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    let tables = 40;
+    let columns = (0..12)
+        .map(|c| format!("column_with_a_long_name_{c:02} TEXT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for i in 0..tables {
+        db.conn
+            .execute(format!(
+                "CREATE TABLE t{i}({columns}, \
+                 UNIQUE(column_with_a_long_name_00), \
+                 UNIQUE(column_with_a_long_name_01), \
+                 UNIQUE(column_with_a_long_name_02))"
+            ))
+            .unwrap();
+        db.conn
+            .execute(format!(
+                "INSERT INTO t{i} VALUES ('a{i}', 'b{i}', 'c{i}', 'd{i}', 'e{i}', 'f{i}', \
+                 'g{i}', 'h{i}', 'i{i}', 'j{i}', 'k{i}', 'l{i}')"
+            ))
+            .unwrap();
+    }
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    for i in 0..tables {
+        db.conn
+            .execute(format!(
+                "INSERT INTO t{i} VALUES ('A{i}', 'B{i}', 'C{i}', 'D{i}', 'E{i}', 'F{i}', \
+                 'G{i}', 'H{i}', 'I{i}', 'J{i}', 'K{i}', 'L{i}')"
+            ))
+            .unwrap();
+    }
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+    for i in 0..tables {
+        let name = format!("t{i}");
+        assert!(
+            objects.iter().any(|object| object.name == name),
+            "{name} missing from portable object maps"
+        );
+    }
+}
+
 /// Encrypted version of test_recovery_checkpoint_then_more_writes.
 /// Checkpoint some rows, write more without checkpointing, restart, verify all rows survive.
 #[test]
@@ -18609,6 +18693,57 @@ fn test_nextval_no_inner_tx_retry_on_concurrent_mvcc() {
     );
 }
 
+#[test]
+fn test_sequence_write_conflict_rolls_back_outer_tx_and_rejects_commit() {
+    let db = MvccTestDbNoConn::new();
+    let setup = db.connect();
+    setup.execute("CREATE TABLE t(a INTEGER)").unwrap();
+    setup.execute("CREATE SEQUENCE s").unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let nextval_conn = db.connect();
+    let setval_conn = db.connect();
+
+    nextval_conn.execute("BEGIN CONCURRENT").unwrap();
+    setval_conn.execute("BEGIN CONCURRENT").unwrap();
+    nextval_conn.execute("DELETE FROM t WHERE TRUE").unwrap();
+
+    let setval_rows = get_rows(&setval_conn, "SELECT setval('s', 100, true)");
+    assert_eq!(setval_rows[0][0].as_int().unwrap(), 100);
+
+    let nextval = nextval_conn.execute("SELECT nextval('s')");
+    assert!(
+        matches!(nextval, Err(LimboError::WriteWriteConflict)),
+        "conflicting nextval must abort with WriteWriteConflict, got {nextval:?}"
+    );
+
+    setval_conn.execute("COMMIT").unwrap();
+
+    assert!(
+        nextval_conn.get_auto_commit(),
+        "write-write conflict must leave the losing connection in autocommit"
+    );
+    assert_eq!(
+        nextval_conn.get_mv_tx_id(),
+        None,
+        "write-write conflict must clear the losing connection's MVCC tx"
+    );
+
+    let commit = nextval_conn.execute("COMMIT");
+    let expected = "cannot commit - no transaction is active";
+    assert!(
+        matches!(commit, Err(LimboError::TxError(ref msg)) if msg == expected),
+        "COMMIT after conflict rollback must report no active transaction, got {commit:?}"
+    );
+
+    let rows = get_rows(&setup, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        1,
+        "the DELETE from the rolled-back transaction must not persist"
+    );
+}
+
 /// Regression: a multi-row `INSERT INTO autoinc_table VALUES (...), (...)`
 /// inside `BEGIN CONCURRENT` whose second-row nextval exhausts the
 /// AUTOINCREMENT sequence must leave NO partial row committed — even
@@ -19494,4 +19629,259 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
         }
     }
     assert_integrity_ok(&conn_c);
+}
+
+/// Repro for https://github.com/tursodatabase/turso/issues/7956.
+///
+/// A passive checkpoint must materialize CREATE at its snapshot, but publishing
+/// the positive rootpage must not clobber a concurrent DROP's end stamp on that
+/// schema version (which would resurrect the table).
+#[test]
+fn test_passive_checkpoint_preserves_drop_committed_after_collection() {
+    use crate::StepResult;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE driver(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 'live')").unwrap();
+    let root_before = get_rows(
+        &setup,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        root_before < 0,
+        "t must still have an unpublished MVCC root, got {root_before}"
+    );
+
+    let checkpoint_conn = db.connect();
+    checkpoint_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let injector = FixedYieldInjector::new([
+        CheckpointYieldPoint::AfterCollectTableRows.point(),
+        CheckpointYieldPoint::BeforeAcquireLock.point(),
+    ]);
+    checkpoint_conn.set_yield_injector(Some(injector.clone()));
+    let mut checkpoint = checkpoint_conn
+        .prepare("INSERT INTO driver VALUES (1)")
+        .unwrap();
+    let pager_io = checkpoint_conn.pager.load().io.clone();
+
+    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::IO | StepResult::Yield => {
+                    if injector.remaining_len() == expect_remaining {
+                        return true;
+                    }
+                    pager_io.step().unwrap();
+                }
+                StepResult::Done => return false,
+                other => panic!("unexpected checkpoint step: {other:?}"),
+            }
+        }
+        false
+    };
+
+    assert!(
+        step_to_next_yield(&mut checkpoint, 1),
+        "passive checkpoint must park after collecting its table-row snapshot"
+    );
+
+    let dropper = db.connect();
+    dropper.execute("DROP TABLE t").unwrap();
+    let dropped_schema_rows = get_rows(
+        &dropper,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    );
+    assert!(
+        dropped_schema_rows.is_empty(),
+        "DROP must be visible before the parked checkpoint resumes"
+    );
+
+    assert!(
+        step_to_next_yield(&mut checkpoint, 0),
+        "passive checkpoint must reach the pre-lock yield after DROP"
+    );
+    let mut checkpoint_done = false;
+    for _ in 0..200_000 {
+        match checkpoint.step().unwrap() {
+            StepResult::Done => {
+                checkpoint_done = true;
+                break;
+            }
+            StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+            other => panic!("unexpected checkpoint step after DROP: {other:?}"),
+        }
+    }
+    assert!(checkpoint_done, "passive checkpoint did not finish");
+    checkpoint_conn.set_yield_injector(None);
+    drop(checkpoint);
+
+    let observer = db.connect();
+    let schema_rows_after_racing_checkpoint = get_rows(
+        &observer,
+        "SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    );
+    let integrity_after_racing_checkpoint = get_rows(&observer, "PRAGMA integrity_check");
+
+    observer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let schema_rows_after_followup_checkpoint = get_rows(
+        &observer,
+        "SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    );
+    let integrity_after_followup_checkpoint = get_rows(&observer, "PRAGMA integrity_check");
+
+    assert!(
+        schema_rows_after_racing_checkpoint.is_empty()
+            && schema_rows_after_followup_checkpoint.is_empty(),
+        "committed DROP was lost: after racing checkpoint={schema_rows_after_racing_checkpoint:?}, \
+         after follow-up checkpoint={schema_rows_after_followup_checkpoint:?}; integrity results: \
+         racing={integrity_after_racing_checkpoint:?}, \
+         follow-up={integrity_after_followup_checkpoint:?}"
+    );
+    let ok = vec![vec![Value::build_text("ok")]];
+    assert_eq!(integrity_after_racing_checkpoint, ok);
+    assert_eq!(integrity_after_followup_checkpoint, ok);
+}
+
+/// Repro for https://github.com/tursodatabase/turso/issues/7957.
+///
+/// A late DROP of an already-materialized table while a passive checkpoint is
+/// parked after collection must keep the dropped root in `dropped_root_pages`
+/// until a later checkpoint actually frees that btree.
+#[test]
+fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
+    use crate::StepResult;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE keep(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO keep VALUES (1, 'live')")
+        .unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let keep_root = get_rows(
+        &setup,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'keep'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        keep_root > 0,
+        "keep must have a materialized root, got {keep_root}"
+    );
+
+    setup
+        .execute("CREATE TABLE work(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO work VALUES (1, 'work')")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE driver(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    let checkpoint_conn = db.connect();
+    checkpoint_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let injector = FixedYieldInjector::new([
+        CheckpointYieldPoint::AfterCollectTableRows.point(),
+        CheckpointYieldPoint::BeforeAcquireLock.point(),
+    ]);
+    checkpoint_conn.set_yield_injector(Some(injector.clone()));
+    let mut checkpoint = checkpoint_conn
+        .prepare("INSERT INTO driver VALUES (1)")
+        .unwrap();
+    let pager_io = checkpoint_conn.pager.load().io.clone();
+
+    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::IO | StepResult::Yield => {
+                    if injector.remaining_len() == expect_remaining {
+                        return true;
+                    }
+                    pager_io.step().unwrap();
+                }
+                StepResult::Done => return false,
+                other => panic!("unexpected checkpoint step: {other:?}"),
+            }
+        }
+        false
+    };
+
+    assert!(
+        step_to_next_yield(&mut checkpoint, 1),
+        "passive checkpoint must park after collecting its table-row snapshot"
+    );
+
+    let dropper = db.connect();
+    dropper.execute("DROP TABLE keep").unwrap();
+    let dropped_schema_rows = get_rows(
+        &dropper,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'keep'",
+    );
+    assert!(
+        dropped_schema_rows.is_empty(),
+        "DROP must be visible before the parked checkpoint resumes"
+    );
+    let expected_integrity = vec![vec![Value::build_text("ok")]];
+    let integrity_before_resume = get_rows(&dropper, "PRAGMA integrity_check");
+    assert_eq!(
+        integrity_before_resume, expected_integrity,
+        "the committed DROP must keep its still-allocated root accounted for"
+    );
+
+    assert!(
+        step_to_next_yield(&mut checkpoint, 0),
+        "passive checkpoint must reach the pre-lock yield after DROP"
+    );
+    let mut checkpoint_done = false;
+    for _ in 0..200_000 {
+        match checkpoint.step().unwrap() {
+            StepResult::Done => {
+                checkpoint_done = true;
+                break;
+            }
+            StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+            other => panic!("unexpected checkpoint step after DROP: {other:?}"),
+        }
+    }
+    assert!(checkpoint_done, "passive checkpoint did not finish");
+    checkpoint_conn.set_yield_injector(None);
+    drop(checkpoint);
+
+    let observer = db.connect();
+    let schema_rows_after_checkpoint = get_rows(
+        &observer,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'keep'",
+    );
+    assert!(
+        schema_rows_after_checkpoint.is_empty(),
+        "keep must remain dropped"
+    );
+    let integrity_after_checkpoint = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(
+        integrity_after_checkpoint, expected_integrity,
+        "checkpoint lost the late DROP's still-allocated root {keep_root}"
+    );
 }

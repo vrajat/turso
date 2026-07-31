@@ -260,6 +260,7 @@ pub struct ProgramBuilder {
     next_free_cursor_id: usize,
     next_hash_table_id: usize,
     pub table_references: TableReferences,
+    postgres_explain: Option<Vec<String>>,
     /// Current parsing nesting level
     nested_level: usize,
     init_label: BranchOffset,
@@ -542,12 +543,14 @@ pub enum QueryMode {
     Normal,
     Explain,
     ExplainQueryPlan,
+    ExplainPostgres,
 }
 
 impl QueryMode {
     pub const fn new(cmd: &ast::Cmd) -> Self {
         match cmd {
             ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
+            ast::Cmd::ExplainPostgres(_) => QueryMode::ExplainPostgres,
             ast::Cmd::Explain(_) => QueryMode::Explain,
             ast::Cmd::Stmt(_) => QueryMode::Normal,
         }
@@ -666,6 +669,7 @@ impl ProgramBuilder {
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
+            postgres_explain: None,
             collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
@@ -748,6 +752,30 @@ impl ProgramBuilder {
     /// Check whether a name refers to a CTE currently being planned.
     pub fn is_cte_being_defined(&self, name: &str) -> bool {
         self.ctes_being_defined.iter().any(|n| n == name)
+    }
+
+    /// Hide CTEs being defined whose names an inner WITH clause redefines:
+    /// the inner definitions shadow the outer names for that lexical scope,
+    /// so references to them are not circular. Returns the hidden names for
+    /// [Self::unmask_shadowed_ctes_being_defined].
+    pub fn mask_shadowed_ctes_being_defined(&mut self, shadowing_names: &[String]) -> Vec<String> {
+        let mut masked = Vec::new();
+        self.ctes_being_defined.retain(|name| {
+            if shadowing_names.contains(name) {
+                masked.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        masked
+    }
+
+    /// Restore names hidden by [Self::mask_shadowed_ctes_being_defined] when
+    /// their shadowing scope ends. Membership is all that matters for the
+    /// circular-reference check, so restore order is irrelevant.
+    pub fn unmask_shadowed_ctes_being_defined(&mut self, masked: Vec<String>) {
+        self.ctes_being_defined.extend(masked);
     }
 
     /// Temporarily take the CTE-being-defined stack (e.g. during view
@@ -1117,6 +1145,36 @@ impl ProgramBuilder {
 
     pub const fn get_query_mode(&self) -> QueryMode {
         self.query_mode
+    }
+
+    pub fn set_postgres_explain(&mut self, lines: Vec<String>) {
+        turso_assert!(self.query_mode == QueryMode::ExplainPostgres);
+        self.postgres_explain = Some(lines);
+    }
+
+    /// Add an INSERT root above an already-rendered PostgreSQL EXPLAIN source.
+    ///
+    /// This changes presentation only; it does not add a node to the optimizer
+    /// plan or VDBE program. The root estimate is currently reused from the
+    /// rendered source text rather than retained as structured plan data.
+    pub fn wrap_postgres_explain_insert(&mut self, root: String) {
+        turso_assert!(self.query_mode == QueryMode::ExplainPostgres);
+        let mut source = self
+            .postgres_explain
+            .take()
+            .unwrap_or_else(|| vec!["Result".to_string()]);
+        let estimate = source
+            .first()
+            .and_then(|line| line.find("  (cost=").map(|start| line[start..].to_string()));
+        let first = source
+            .first_mut()
+            .expect("PostgreSQL EXPLAIN source plans must contain a root node");
+        *first = format!("  -> {first}");
+        for line in &mut source[1..] {
+            line.insert_str(0, "  ");
+        }
+        source.insert(0, format!("{root}{}", estimate.unwrap_or_default()));
+        self.postgres_explain = Some(source);
     }
 
     /// use emit_explain macro instead, because we don't want to allocate
@@ -1787,9 +1845,12 @@ impl ProgramBuilder {
         self.table_references.contains_table(table)
     }
 
-    /// Returns true if the cursor is a BTreeTable cursor.
+    /// Returns true if the cursor is backed by a table or index B-tree.
     pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
-        matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
+        matches!(
+            self.cursor_ref[cursor_id].1,
+            CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+        )
     }
 
     /// Returns the BTreeTable for the given cursor, if it is a BTreeTable cursor.
@@ -1995,6 +2056,7 @@ impl ProgramBuilder {
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
+            postgres_explain: self.postgres_explain,
             sql: sql.to_string(),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,

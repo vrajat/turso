@@ -43,8 +43,8 @@ impl Dialect for PostgresDialect {
             None => sql.len(),
         };
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        match translator.translate(&parse_result) {
-            Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
+        match translator.translate_cmd(&parse_result) {
+            Ok(cmd) => Ok((Some(cmd), consumed)),
             Err(_) => turso_core::dialect::sqlite::parse(sql),
         }
     }
@@ -1187,14 +1187,16 @@ impl PgDatabaseTable {
     fn new() -> Self {
         Self
     }
+}
 
-    fn db_name_from_path(path: &str) -> String {
-        std::path::Path::new(path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(path)
-            .to_string()
-    }
+/// Shared by the pg_database virtual table and current_database() so both
+/// report the same database name.
+pub(crate) fn db_name_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string()
 }
 
 impl InternalVirtualTable for PgDatabaseTable {
@@ -1289,7 +1291,7 @@ impl InternalVirtualTableCursor for PgDatabaseCursor {
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
-        let db_name = PgDatabaseTable::db_name_from_path(self.conn.db_file_path());
+        let db_name = db_name_from_path(self.conn.db_file_path());
         self.rows = vec![vec![
             Value::from_i64(16384),           // oid
             Value::build_text(db_name),       // datname

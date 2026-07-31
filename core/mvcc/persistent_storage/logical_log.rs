@@ -947,6 +947,15 @@ impl LogicalLog {
             .expect("advance_offset_after_success called without pending deferred write");
     }
 
+    /// Discard the pending running CRC staged by a deferred write whose
+    /// two-phase commit aborted before the offset advanced.
+    ///
+    /// This must be called on the abort path so no later write chains its
+    /// running CRC from a value staged for a write that never confirmed.
+    pub fn discard_pending_write(&mut self) {
+        self.pending_running_crc = None;
+    }
+
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("logical_log_sync finish");
@@ -3785,7 +3794,9 @@ mod tests {
         let file = io.open_file(file_name, OpenFlags::Create, false).unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord::new(commit_ts);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(commit_ts, crate::alloc::DynAllocator::default())
+                .unwrap();
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
@@ -4636,7 +4647,9 @@ mod tests {
         let op_size = 6 + payload_len_len + payload_len;
         let frame_size = TX_HEADER_SIZE + op_size + TX_TRAILER_SIZE;
 
-        let mut tx1 = crate::mvcc::database::LogRecord::new(10);
+        let mut tx1 =
+            crate::mvcc::database::LogRecord::new(10, crate::alloc::DynAllocator::default())
+                .unwrap();
         tx1.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
             begin: crate::mvcc::database::PackedTs::pack(Some(
@@ -4650,7 +4663,9 @@ mod tests {
         let c = log.log_tx(tx1).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut tx2 = crate::mvcc::database::LogRecord::new(20);
+        let mut tx2 =
+            crate::mvcc::database::LogRecord::new(20, crate::alloc::DynAllocator::default())
+                .unwrap();
         tx2.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 2,
             begin: crate::mvcc::database::PackedTs::pack(Some(
@@ -4960,7 +4975,9 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord::new(123);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(123, crate::alloc::DynAllocator::default())
+                .unwrap();
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
@@ -5438,7 +5455,9 @@ mod tests {
             .open_file("bitflip.db-log", crate::OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
-        let mut tx = crate::mvcc::database::LogRecord::new(300);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(300, crate::alloc::DynAllocator::default())
+                .unwrap();
         tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
             begin: crate::mvcc::database::PackedTs::pack(Some(
@@ -5510,7 +5529,11 @@ mod tests {
 
         let mut expected = Vec::new();
         for tx_i in 0..128u64 {
-            let mut tx = crate::mvcc::database::LogRecord::new(1_000 + tx_i);
+            let mut tx = crate::mvcc::database::LogRecord::new(
+                1_000 + tx_i,
+                crate::alloc::DynAllocator::default(),
+            )
+            .unwrap();
             let op_count = (rng.next_u64() % 4) as usize;
             for _ in 0..op_count {
                 let rowid = (rng.next_u64() % 64) as i64 + 1;
@@ -5568,7 +5591,11 @@ mod tests {
         // correctly when a single frame spans chunk boundaries.
         let large_commit_ts = 1_000 + 128u64;
         let large_text: String = "x".repeat(200);
-        let mut large_tx = crate::mvcc::database::LogRecord::new(large_commit_ts);
+        let mut large_tx = crate::mvcc::database::LogRecord::new(
+            large_commit_ts,
+            crate::alloc::DynAllocator::default(),
+        )
+        .unwrap();
         for rowid in 1..=30i64 {
             let row = generate_simple_string_row((-3).into(), rowid, &large_text);
             expected.push(ExpectedTableOp::Upsert {
@@ -5721,7 +5748,9 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord::new(55);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(55, crate::alloc::DynAllocator::default())
+                .unwrap();
         let mut row = generate_simple_string_row((-2).into(), 1, "foo");
         row.id.table_id = (-2).into();
         let version = crate::mvcc::database::RowVersion {
@@ -5784,7 +5813,9 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord::new(10);
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(10, crate::alloc::DynAllocator::default())
+                .unwrap();
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,

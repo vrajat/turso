@@ -7,12 +7,12 @@ Sorted by implementation difficulty.
 1. ~~**COMMENT ON**~~ — DONE (accepted as a no-op; comments are not persisted)
 2. **PREPARE / EXECUTE / DEALLOCATE** — wire protocol already handles this; just need the SQL syntax to not error
 3. **GRANT/REVOKE** — parse + ignore (single-user system, just don't error)
-4. **More PG system functions** — register existing Turso functions under PG aliases (e.g. `string_agg` → `group_concat`, `regexp_replace`, etc.)
+4. **More PG system functions** — still missing: `current_setting`, `current_schemas(bool)`, a real `pg_get_expr` (currently a NULL stub), and the regexp functions (`extensions/regexp` is not linked into tursopg); session information functions and the `string_agg` family already resolve
 5. **SET search_path** — intercept in try_prepare_pg, store on connection, use in table resolution
 
 ## Easy (a day or two)
 
-6. **CREATE TABLE AS / SELECT INTO** — translate to `CREATE TABLE ... AS SELECT` which Turso already supports
+6. ~~**CREATE TABLE AS / SELECT INTO**~~ — DONE (translates to `CREATE TABLE ... AS SELECT`; WITH NO DATA supported, explicit column list rejected)
 7. **ALTER COLUMN SET/DROP DEFAULT, SET/DROP NOT NULL** — Turso's ALTER TABLE is limited but these map to SQLite operations
 8. **CONCURRENTLY on CREATE INDEX** — just ignore the keyword (SQLite doesn't do concurrent DDL anyway)
 9. **COPY ... FROM/TO with simple CSV** — implement as INSERT loop or SELECT output (not the wire protocol COPY)
@@ -20,7 +20,7 @@ Sorted by implementation difficulty.
 ## Medium (a few days)
 
 10. **Transaction isolation levels** — parse BEGIN ISOLATION LEVEL, map to pragmas or ignore (SQLite has limited isolation)
-11. **EXPLAIN** — Turso has EXPLAIN; just need to pass through the PG EXPLAIN node
+11. ~~**EXPLAIN**~~ — DONE (bare EXPLAIN returns Turso's query-plan summary; PostgreSQL EXPLAIN options remain unsupported)
 12. ~~**Named windows**~~ — DONE (WINDOW clause + OVER name references + window inheritance)
 13. ~~**CREATE MATERIALIZED VIEW**~~ — DONE (uses Turso's live incremental materialized views)
 

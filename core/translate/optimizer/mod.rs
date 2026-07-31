@@ -15,7 +15,7 @@ use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::TableMask;
 use crate::{
     function::{AggFunc, Deterministic},
-    index_method::IndexMethodCostEstimate,
+    index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
@@ -46,7 +46,7 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, ProgramBuilder, QueryMode},
     },
     LimboError, Result,
 };
@@ -503,17 +503,22 @@ fn collect_index_method_candidates(
                     &pattern_match.parameters,
                 );
 
+                // Sort and collect arguments before costing so the index
+                // method can inspect captured literals such as LIMIT.
+                let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
+
                 // Get cost estimate from the index method
                 let cost_estimate = module.init().ok().and_then(|cursor| {
                     let base_rows = base_table_rows
                         .get(table_idx)
                         .map(|r| **r)
                         .unwrap_or(params.rows_per_table_fallback);
-                    cursor.estimate_cost(pattern_match.pattern_idx, base_rows)
+                    cursor.estimate_cost(&IndexMethodCostContext {
+                        pattern_idx: pattern_match.pattern_idx,
+                        base_table_rows: base_rows,
+                        arguments: &arguments,
+                    })
                 });
-
-                // Sort and collect arguments
-                let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
 
                 candidates.push(IndexMethodCandidate {
                     table_idx,
@@ -541,10 +546,40 @@ pub fn optimize_plan(
     plan: &mut Plan,
     resolver: &Resolver,
 ) -> Result<()> {
+    optimize_plan_impl(program, plan, resolver, false).map(|_| ())
+}
+
+/// Optimize a plan and retain the estimates needed by PostgreSQL EXPLAIN.
+#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+#[turso_macros::trace_stack]
+pub fn optimize_plan_for_postgres_explain(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    resolver: &Resolver,
+) -> Result<Option<PostgresExplain>> {
+    turso_assert!(program.get_query_mode() == QueryMode::ExplainPostgres);
+    optimize_plan_impl(program, plan, resolver, true)
+}
+
+fn optimize_plan_impl(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    resolver: &Resolver,
+    collect_postgres_explain: bool,
+) -> Result<Option<PostgresExplain>> {
     match plan {
+        Plan::Select(plan) if collect_postgres_explain => {
+            let explain = optimize_select_plan_impl(plan, resolver, true)?;
+            tracing::debug!(plan_sql = plan.to_string());
+            return Ok(explain);
+        }
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,
-        Plan::Delete(plan) => optimize_delete_plan(plan, resolver)?,
-        Plan::Update(plan) => optimize_update_plan(program, plan, resolver)?,
+        Plan::Delete(plan) => {
+            return optimize_delete_plan(plan, resolver, collect_postgres_explain)
+        }
+        Plan::Update(plan) => {
+            return optimize_update_plan(program, plan, resolver, collect_postgres_explain);
+        }
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
@@ -553,10 +588,30 @@ pub fn optimize_plan(
                 optimize_select_plan(plan, resolver)?;
             }
         }
+        Plan::RecursiveCte(recursive_cte) => {
+            optimize_recursive_cte_query(&mut recursive_cte.initial_query, resolver)?;
+            optimize_recursive_cte_query(&mut recursive_cte.recursive_query, resolver)?;
+        }
     }
-    // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
     tracing::debug!(plan_sql = plan.to_string());
-    Ok(())
+    Ok(None)
+}
+
+fn optimize_recursive_cte_query(query: &mut Plan, resolver: &Resolver) -> Result<()> {
+    match query {
+        Plan::Select(select) => optimize_select_plan(select, resolver),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            for (select, _) in left {
+                optimize_select_plan(select, resolver)?;
+            }
+            optimize_select_plan(right_most, resolver)
+        }
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Err(
+            LimboError::InternalError("recursive CTE query is not a SELECT".to_string()),
+        ),
+    }
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -726,6 +781,24 @@ struct OptimizeTableAccessResult {
     join_order: Vec<JoinOrderMember>,
     output_rows: f64,
     min_max_fast_path: bool,
+    postgres_explain: Option<PostgresExplain>,
+}
+
+/// Cost and cardinality data for a selected access path. It is intentionally
+/// separate from [`SelectPlan`]: only PostgreSQL EXPLAIN needs it, and it must
+/// not become permanent state on normal execution plans.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExplainEstimate {
+    pub cost: f64,
+    pub rows: f64,
+}
+
+/// EXPLAIN-only data captured before the optimizer releases its access-method
+/// arena.
+#[derive(Debug, Clone)]
+pub(crate) struct PostgresExplain {
+    pub total: ExplainEstimate,
+    pub accesses: Vec<(TableInternalId, ExplainEstimate)>,
 }
 
 /**
@@ -735,6 +808,14 @@ struct OptimizeTableAccessResult {
  */
 #[turso_macros::trace_stack]
 pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    optimize_select_plan_impl(plan, resolver, false).map(|_| ())
+}
+
+fn optimize_select_plan_impl(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    collect_postgres_explain: bool,
+) -> Result<Option<PostgresExplain>> {
     let schema = resolver.schema();
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -768,7 +849,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
         plan.contains_constant_false_condition = true;
-        return Ok(());
+        return Ok(None);
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan);
@@ -786,6 +867,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
         &mut plan.limit,
         &mut plan.offset,
         plan.input_cardinality_hint.unwrap_or(1.0),
+        collect_postgres_explain,
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -799,6 +881,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     if let Some(OptimizeTableAccessResult {
         join_order,
         output_rows,
+        postgres_explain,
         ..
     }) = best_join_order
     {
@@ -826,14 +909,20 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
             }
         }
         plan.estimated_output_rows = Some(est);
+        reoptimize_correlated_subqueries(plan, resolver)?;
+        return Ok(postgres_explain);
     }
 
     reoptimize_correlated_subqueries(plan, resolver)?;
 
-    Ok(())
+    Ok(None)
 }
 
-fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()> {
+fn optimize_delete_plan(
+    plan: &mut DeletePlan,
+    resolver: &Resolver,
+    collect_postgres_explain: bool,
+) -> Result<Option<PostgresExplain>> {
     let schema = resolver.schema();
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
@@ -845,14 +934,14 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
         plan.contains_constant_false_condition = true;
-        return Ok(());
+        return Ok(None);
     }
 
     if let Some(rowset_plan) = plan.rowset_plan.as_mut() {
-        optimize_select_plan(rowset_plan, resolver)?;
+        let _ = optimize_select_plan_impl(rowset_plan, resolver, collect_postgres_explain)?;
     }
 
-    let _ = optimize_table_access(
+    let optimize_result = optimize_table_access(
         schema,
         resolver.dialect.as_ref(),
         &mut plan.result_columns,
@@ -866,16 +955,18 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
         &mut plan.limit,
         &mut plan.offset,
         1.0,
+        collect_postgres_explain,
     )?;
 
-    Ok(())
+    Ok(optimize_result.and_then(|result| result.postgres_explain))
 }
 
 fn optimize_update_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
     resolver: &Resolver,
-) -> Result<()> {
+    collect_postgres_explain: bool,
+) -> Result<Option<PostgresExplain>> {
     let schema = resolver.schema();
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
     if is_update_from {
@@ -896,20 +987,20 @@ fn optimize_update_plan(
             let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);
             build_update_write_set_plan(program, plan, update_from_set_result_columns)?;
         }
-        return Ok(());
+        return Ok(None);
     }
     if is_update_from {
         let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);
         build_update_write_set_plan(program, plan, update_from_set_result_columns)?;
-        optimize_select_plan(
+        return optimize_select_plan_impl(
             &mut plan
                 .write_set_plan
                 .as_mut()
                 .expect("UPDATE ... FROM must build its write-set SELECT before optimization")
                 .select,
             resolver,
-        )?;
-        return Ok(());
+            collect_postgres_explain,
+        );
     }
 
     let mut order_by = vec![];
@@ -928,6 +1019,7 @@ fn optimize_update_plan(
         &mut plan.limit,
         &mut plan.offset,
         1.0,
+        collect_postgres_explain,
     )?;
     plan.target_table = target_tables
         .joined_tables()
@@ -940,12 +1032,12 @@ fn optimize_update_plan(
     }
 
     if !plan.safety.requires_stable_write_set() {
-        return Ok(());
+        return Ok(optimize_result.and_then(|result| result.postgres_explain));
     }
 
-    let join_order = optimize_result
-        .map(|result| result.join_order)
-        .unwrap_or_else(|| default_join_order(&target_tables));
+    let (join_order, postgres_explain) = optimize_result
+        .map(|result| (result.join_order, result.postgres_explain))
+        .unwrap_or_else(|| (default_join_order(&target_tables), None));
 
     build_update_write_set_plan(program, plan, Vec::new())?;
     plan.write_set_plan
@@ -953,7 +1045,7 @@ fn optimize_update_plan(
         .expect("stable-write-set UPDATE must build a write-set SELECT")
         .select
         .join_order = join_order;
-    Ok(())
+    Ok(postgres_explain)
 }
 
 fn update_write_set_reason(
@@ -1328,6 +1420,10 @@ fn optimize_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()>
                         optimize_select_plan(select_plan, resolver)?;
                     }
                 }
+                Plan::RecursiveCte(recursive_cte) => {
+                    optimize_recursive_cte_query(&mut recursive_cte.initial_query, resolver)?;
+                    optimize_recursive_cte_query(&mut recursive_cte.recursive_query, resolver)?;
+                }
                 Plan::Delete(_) | Plan::Update(_) => {
                     turso_soft_unreachable!(
                         "DELETE/UPDATE plans should not appear in FROM clause subqueries"
@@ -1413,6 +1509,7 @@ fn select_plan_contains_cte_from_clause_subquery(plan: &SelectPlan) -> bool {
                                 select_plan_contains_cte_from_clause_subquery(select_plan)
                             }) || select_plan_contains_cte_from_clause_subquery(right_most)
                         }
+                        Plan::RecursiveCte(_) => false,
                         Plan::Delete(_) | Plan::Update(_) => false,
                     }
             }
@@ -1855,6 +1952,7 @@ fn optimize_table_access(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
+    collect_postgres_explain: bool,
 ) -> Result<Option<OptimizeTableAccessResult>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2207,6 +2305,27 @@ fn optimize_table_access(
         })
         .collect();
 
+    let postgres_explain = collect_postgres_explain.then(|| PostgresExplain {
+        total: ExplainEstimate {
+            cost: best_plan.cost.0,
+            rows: final_output_cardinality,
+        },
+        accesses: best_table_numbers
+            .iter()
+            .zip(best_access_methods.iter())
+            .map(|(&table_idx, &access_method_idx)| {
+                let access_method = &access_methods_arena[access_method_idx];
+                (
+                    table_references.joined_tables()[table_idx].internal_id,
+                    ExplainEstimate {
+                        cost: access_method.cost.0,
+                        rows: access_method.estimated_rows_per_outer_row,
+                    },
+                )
+            })
+            .collect(),
+    });
+
     // Mutate the Operations in `joined_tables` to use the selected access methods.
     // We iterate over ALL tables (including hash join build tables) to set their operations,
     // even though build tables are not in best_join_order.
@@ -2454,6 +2573,10 @@ fn optimize_table_access(
                         iter_dir: *iter_dir,
                     });
             }
+            AccessMethodParams::RecursiveCteInput => {
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::Scan(Scan::RecursiveCteInput);
+            }
             AccessMethodParams::MaterializedSubquery {
                 index,
                 constraint_refs,
@@ -2689,6 +2812,7 @@ fn optimize_table_access(
         output_rows: final_output_cardinality,
         min_max_fast_path: matches!(simple_aggregate, Some(SimpleAggregate::MinMax(_)))
             && sort_eliminated,
+        postgres_explain,
     }))
 }
 
@@ -3794,10 +3918,10 @@ mod tests {
                 Expr::InList {
                     lhs: Box::new(fn_call(
                         "hex",
-                        vec![Expr::Literal(ast::Literal::Blob("01".into()))],
+                        vec![Expr::Literal(ast::Literal::Blob("X'01'".into()))],
                     )),
                     not: false,
-                    rhs: vec![Box::new(Expr::Literal(ast::Literal::Blob("02".into())))],
+                    rhs: vec![Box::new(Expr::Literal(ast::Literal::Blob("X'02'".into())))],
                 },
             ],
         );

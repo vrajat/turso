@@ -252,6 +252,13 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     owns_checkpoint_in_progress: bool,
     /// Roots allocated this checkpoint; published with `visible_from = durable_txid_max_new`.
     staged_roots: Vec<MVTableId>,
+    /// Positive roots materialized this pass whose schema version was already ended
+    /// (e.g. DROP after our snapshot). Tracked in `dropped_root_pages` until a later
+    /// checkpoint frees the btree.
+    ended_created_roots: HashSet<i64>,
+    /// Positive roots whose btrees were destroyed in this checkpoint's pager write.
+    /// Only these may be removed from `dropped_root_pages` at publish.
+    freed_root_pages: HashSet<i64>,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -828,6 +835,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             local_schema: None,
             owns_checkpoint_in_progress: false,
             staged_roots: crate::alloc::vec![],
+            ended_created_roots: HashSet::default(),
+            freed_root_pages: HashSet::default(),
         }
     }
 
@@ -1276,7 +1285,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             processed += 1;
             if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Ok(Some(IOCompletions::Single(Completion::new_yield())));
+                return Ok(Some(IOCompletions(Completion::new_yield())));
             }
         }
         // Writing in ascending order of rowid gives us a better chance of using balance-quick algorithm
@@ -1345,7 +1354,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 processed += 1;
                 if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                    return Ok(Some(IOCompletions::Single(Completion::new_yield())));
+                    return Ok(Some(IOCompletions(Completion::new_yield())));
                 }
             }
             self.collect_index_tableid_cursor = Some(index_id);
@@ -1515,19 +1524,34 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .get(&key)
                 .expect("sqlite_schema row not found");
             let mut row_versions = sqlite_schema_row.value().write();
-            // Replace in place (same version id), don't append: a duplicate (id, begin, end)
-            // would leave a phantom current version after a later DELETE (which ends only the
-            // first match), causing spurious write-write conflicts at commit time.
+            // Patch payload in place (same version id), don't append: a duplicate
+            // (id, begin, end) would leave a phantom current version after a later
+            // DELETE (which ends only the first match), causing spurious write-write
+            // conflicts at commit time.
+            //
+            // Only replace the row payload (positive rootpage). Preserve begin/end so a
+            // DROP that committed after our snapshot keeps its end stamp — wholesale
+            // replace of the collected clone would resurrect the table (#7956).
             let vid = row_version.id;
             if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                *existing = row_version;
+                existing.row.data = row_version.row.data;
+                if existing.end().is_some() {
+                    if let Some(identity) = sqlite_schema_btree_identity(existing) {
+                        if identity.root_page > 0 {
+                            self.ended_created_roots.insert(identity.root_page);
+                        }
+                    }
+                }
             } else {
                 self.mvstore
                     .insert_version_raw(&mut row_versions, row_version)?;
             }
         }
 
-        if !self.has_unpublished_schema_changes() {
+        if !self.has_unpublished_schema_changes()
+            && self.ended_created_roots.is_empty()
+            && self.freed_root_pages.is_empty()
+        {
             return Ok(());
         }
 
@@ -1585,9 +1609,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
 
-        // Clear dropped root pages now that the pager commit contains the btree frees.
-        // integrity_check should now follow the committed freelist state instead.
-        schema.dropped_root_pages.clear();
+        // Only forget roots whose btrees this checkpoint actually freed. A concurrent
+        // DROP after our snapshot may have added roots we did not destroy (#7957).
+        for root in std::mem::take(&mut self.freed_root_pages) {
+            schema.dropped_root_pages.remove(&root);
+        }
+        // Roots we materialized whose schema versions were already ended are still
+        // allocated and must stay accounted for until a later destroy (#7956).
+        schema
+            .dropped_root_pages
+            .extend(std::mem::take(&mut self.ended_created_roots));
         drop(schema_ref);
         *self.connection.schema.write() = self.connection.db.clone_schema();
         self.connection.bump_prepare_context_generation();
@@ -1769,7 +1800,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             };
             *next_index = index;
 
-            Some(IOCompletions::Single(Completion::new_yield()))
+            Some(IOCompletions(Completion::new_yield()))
         } else {
             None
         }
@@ -1836,7 +1867,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
             };
             *next_index = index;
-            Some(IOCompletions::Single(Completion::new_yield()))
+            Some(IOCompletions(Completion::new_yield()))
         } else {
             None
         }
@@ -2203,6 +2234,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_tables.insert(table_id);
+                            self.freed_root_pages.insert(root_page as i64);
                             // Deferred destroy: retire the binding (set its `end` to the drop ts)
                             // but keep it, so a transaction still scanning this table at an older
                             // snapshot resolves the (read-mark-protected) root page. GC'd once
@@ -2269,6 +2301,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_indexes.insert(index_id);
+                            self.freed_root_pages.insert(root_page as i64);
                             // Deferred destroy: retire the binding (set its `end`) but keep it so
                             // a transaction still scanning this index at an older snapshot resolves
                             // the (read-mark-protected) root page. GC'd once `lwm` passes the drop.
@@ -2720,9 +2753,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             tracing::debug!(
                                 "passive checkpoint publish contended; yielding for retry"
                             );
-                            return Ok(TransitionResult::Io(IOCompletions::Single(
-                                Completion::new_yield(),
-                            )));
+                            return Ok(TransitionResult::Io(
+                                IOCompletions(Completion::new_yield()),
+                            ));
                         }
                         return Err(crate::LimboError::Busy);
                     }
@@ -2771,7 +2804,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }
                     Ok(TransitionResult::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
 
@@ -2789,7 +2822,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
 
@@ -2838,7 +2871,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .db_file
                     .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
                 checkpoint_result.db_sync_sent = true;
-                Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                Ok(TransitionResult::Io(IOCompletions(c)))
             }
 
             CheckpointState::TruncateWal => {

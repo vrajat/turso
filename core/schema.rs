@@ -12,7 +12,9 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
-use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
+use crate::translate::index::{
+    reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -2722,6 +2724,17 @@ impl TryClone for FromClauseSubquery {
     }
 }
 
+impl TryClone for RecursiveCteInput {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: self.name.clone(),
+            columns: self.columns.try_clone()?,
+        })
+    }
+}
+
 impl TryClone for Table {
     type Error = TryReserveError;
 
@@ -2731,6 +2744,9 @@ impl TryClone for Table {
             Table::Virtual(table) => Table::Virtual(Arc::new(table.as_ref().try_clone()?)),
             Table::FromClauseSubquery(from_clause_subquery) => {
                 Table::FromClauseSubquery(Arc::new(from_clause_subquery.as_ref().try_clone()?))
+            }
+            Table::RecursiveCteInput(input) => {
+                Table::RecursiveCteInput(Arc::new(input.as_ref().try_clone()?))
             }
         })
     }
@@ -2858,6 +2874,9 @@ impl ColumnLayout {
             Table::FromClauseSubquery(subquery) => Ok(Self::Identity {
                 column_count: subquery.columns.len(),
             }),
+            Table::RecursiveCteInput(input) => Ok(Self::Identity {
+                column_count: input.columns.len(),
+            }),
         }
     }
 
@@ -2965,6 +2984,7 @@ pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
     FromClauseSubquery(Arc<FromClauseSubquery>),
+    RecursiveCteInput(Arc<RecursiveCteInput>),
 }
 
 impl Table {
@@ -2977,6 +2997,9 @@ impl Table {
             Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
                 "FROM clause subqueries do not have a root page".to_string(),
             )),
+            Table::RecursiveCteInput(_) => Err(crate::LimboError::InternalError(
+                "recursive CTE inputs do not have a root page".to_string(),
+            )),
         }
     }
 
@@ -2985,6 +3008,7 @@ impl Table {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
+            Self::RecursiveCteInput(input) => &input.name,
         }
     }
 
@@ -2995,6 +3019,7 @@ impl Table {
             Self::FromClauseSubquery(from_clause_subquery) => {
                 from_clause_subquery.columns.get(index)
             }
+            Self::RecursiveCteInput(input) => input.columns.get(index),
         }
     }
 
@@ -3016,6 +3041,11 @@ impl Table {
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(name))
                 }),
+            Self::RecursiveCteInput(input) => input.columns.iter().enumerate().find(|(_, col)| {
+                col.name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            }),
         }
     }
 
@@ -3024,6 +3054,7 @@ impl Table {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
+            Self::RecursiveCteInput(input) => &input.columns,
         }
     }
 
@@ -3032,6 +3063,7 @@ impl Table {
             Self::BTree(table) => table.is_strict,
             Self::Virtual(_) => false,
             Self::FromClauseSubquery(_) => false,
+            Self::RecursiveCteInput(_) => false,
         }
     }
 
@@ -3040,6 +3072,7 @@ impl Table {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3057,6 +3090,7 @@ impl Table {
             Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3957,6 +3991,13 @@ pub struct FromClauseSubquery {
     pub cte: Option<FromClauseSubqueryCteMetadata>,
 }
 
+/// The one-row table read by the recursive part of a recursive CTE.
+#[derive(Debug, Clone)]
+pub struct RecursiveCteInput {
+    pub name: String,
+    pub columns: Vec<Column>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FromClauseSubqueryCteMetadata {
     /// Identity shared by all references to the same CTE definition.
@@ -4403,6 +4444,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     if *auto_increment {
                         has_autoincrement = true;
                     }
+                    reject_explicit_nulls(columns)?;
 
                     let mut pk_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
@@ -4431,6 +4473,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
+                    reject_explicit_nulls(columns)?;
                     let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
                     let mut unique_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
@@ -5446,9 +5489,11 @@ impl TryFrom<&ColumnDefinition> for Column {
             match constraint {
                 ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
                 ast::ColumnConstraint::NotNull {
-                    conflict_clause, ..
+                    nullable,
+                    conflict_clause,
+                    ..
                 } => {
-                    notnull = true;
+                    notnull = !nullable;
                     notnull_conflict_clause = *conflict_clause;
                 }
                 ast::ColumnConstraint::Unique(..) => unique = true,
@@ -5629,6 +5674,43 @@ pub struct IndexColumn {
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
+}
+
+impl IndexColumn {
+    /// Returns a default column with the given name and position.
+    pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            order: SortOrder::Asc,
+            pos_in_table,
+            collation: None,
+            default: None,
+            expr: None,
+        }
+    }
+
+    pub fn new_many<I>(names: I) -> Vec<Self>
+    where
+        I: IntoIterator,
+        I::Item: ToString,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let iter = names.into_iter();
+        let mut cols = <Vec<_> as TursoVecExt<_>>::with_capacity(iter.len());
+
+        iter.enumerate()
+            .map(|(i, name)| Self {
+                name: name.to_string(),
+                order: SortOrder::Asc,
+                pos_in_table: i,
+                collation: None,
+                default: None,
+                expr: None,
+            })
+            .for_each(|col| cols.push(col));
+
+        cols
+    }
 }
 
 impl Index {

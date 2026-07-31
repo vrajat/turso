@@ -17,6 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
@@ -41,7 +42,7 @@ pub mod value;
 // for benchmarks
 pub use crate::translate::collate::CollationSeq;
 use crate::{
-    alloc::DynAllocator,
+    alloc::{DynAllocator, TryClone},
     error::LimboError,
     function::FuncCtx,
     mvcc::{database::CommitStateMachine, MvccClock},
@@ -73,7 +74,7 @@ use crate::sync::RwLock;
 use crate::{
     storage::pager::Pager,
     translate::plan::ResultSetColumn,
-    types::{AggContext, Cursor, ImmutableRecord, Value},
+    types::{AggContext, Cursor, ImmutableRecord, RecordBuf, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 use crate::{
@@ -91,7 +92,9 @@ use turso_parser::ast::ResolveType;
 use crate::io::TempFile;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
-use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
+use explain::{
+    insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS, POSTGRES_EXPLAIN_COLUMNS,
+};
 use std::{
     collections::HashMap,
     num::NonZero,
@@ -261,7 +264,76 @@ pub enum Register {
     Record(ImmutableRecord),
 }
 
+impl TryClone for Register {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
+            Register::Aggregate(context) => Ok(Register::Aggregate(context.try_clone()?)),
+            Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
+                record.get_payload(),
+                RecordBuf::alloc(),
+            )?)),
+        }
+    }
+
+    /// Fallibly copies `source` into this register, reusing the destination's
+    /// Value or record allocation when the variants match; see
+    /// [Value::try_clone_from].
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    fn try_clone_from(&mut self, source: &Self) -> Result<(), Self::Error> {
+        match (self, source) {
+            (Register::Value(dst), Register::Value(src)) => dst.try_clone_from(src)?,
+            (Register::Record(dst), Register::Record(src)) => {
+                let buf = dst.as_blob_mut();
+                buf.clear();
+                buf.try_extend(src.get_payload().iter().copied())?;
+            }
+            (dst, Register::Value(src)) => {
+                let mut value = Value::Null;
+                value.try_clone_from(src)?;
+                *dst = Register::Value(value);
+            }
+            (dst, Register::Record(src)) => {
+                *dst = Register::Record(ImmutableRecord::copy_payload(
+                    src.get_payload(),
+                    RecordBuf::alloc(),
+                )?);
+            }
+            (dst, Register::Aggregate(src)) => *dst = Register::Aggregate(src.try_clone()?),
+        }
+        Ok(())
+    }
+}
+
 impl Register {
+    /// Takes the register's spent record buffer for reuse, leaving NULL.
+    /// Callers about to overwrite the register use this to recycle its
+    /// allocation instead of dropping it.
+    #[inline]
+    pub fn take_buf(&mut self) -> RecordBuf {
+        match std::mem::replace(self, Register::Value(Value::Null)) {
+            Register::Record(record) => record.retire(),
+            _ => RecordBuf::alloc(),
+        }
+    }
+
+    /// Fallibly sets the register to a copy of `val`, reusing the register's
+    /// existing allocation when possible; see [Value::try_clone_from].
+    #[inline]
+    pub fn try_clone_value_from(&mut self, val: &Value) -> crate::Result<()> {
+        match self {
+            Register::Value(v) => v.try_clone_from(val)?,
+            _ => {
+                let mut value = Value::Null;
+                value.try_clone_from(val)?;
+                *self = Register::Value(value);
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     pub const fn is_null(&self) -> bool {
         matches!(self, Register::Value(Value::Null))
@@ -749,8 +821,6 @@ pub struct ProgramState {
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
-    /// Current collation sequence set by OP_CollSeq instruction
-    current_collation: Option<CollationSeq>,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
@@ -846,7 +916,6 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
-            current_collation: None,
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
@@ -956,7 +1025,6 @@ impl ProgramState {
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
-        self.current_collation = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -967,7 +1035,6 @@ impl ProgramState {
         self.commit_state.cleanup_mvcc_checkpoint_state();
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
-        self.current_collation = None;
         self.commit_state = CommitState::Ready;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
         // it was mid-step the inner mv_tx has already been swapped back
@@ -1439,6 +1506,7 @@ pub struct PreparedProgram {
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
+    pub postgres_explain: Option<Vec<String>>,
     pub sql: String,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
@@ -1573,6 +1641,7 @@ impl Program {
             QueryMode::Normal => self.normal_step(state, pager, waker),
             QueryMode::Explain => self.explain_step(state, pager),
             QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, pager),
+            QueryMode::ExplainPostgres => self.explain_postgres_step(state, pager),
         };
         match &result {
             Ok(StepResult::Done) => {
@@ -1730,6 +1799,39 @@ impl Program {
             state.pc += 1;
             return Ok(StepResult::Row);
         }
+    }
+
+    fn explain_postgres_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<StepResult> {
+        turso_debug_assert!(state.column_count() == POSTGRES_EXPLAIN_COLUMNS.len());
+        if self.connection.is_closed() {
+            let tx_state = self.connection.get_tx_state();
+            if let TransactionState::Write { .. } = tx_state {
+                pager.rollback_tx(&self.connection);
+            }
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+            return Ok(StepResult::Interrupt);
+        }
+
+        let Some(lines) = self.prepared.postgres_explain.as_ref() else {
+            return Ok(StepResult::Done);
+        };
+        let Some(line) = lines.get(state.pc as usize) else {
+            return Ok(StepResult::Done);
+        };
+        state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+        state.registers[0].set_value(Value::from_text(line.clone()));
+        state.result_row = Some(Row {
+            values: &state.registers[0] as *const Register,
+            count: POSTGRES_EXPLAIN_COLUMNS.len(),
+        });
+        state.pc += 1;
+        Ok(StepResult::Row)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2011,6 +2113,16 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
     ) -> Result<IOResult<()>> {
+        if !rollback {
+            turso_assert!(
+                !matches!(
+                    program_state.sequence_inner_tx_pending.as_ref(),
+                    Some(pending) if pending.saved_outer.is_some()
+                ),
+                "cannot commit while a sequence inner tx has a saved outer user tx"
+            );
+        }
+
         // Apply view deltas with I/O handling
         match self.apply_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2654,6 +2766,13 @@ impl Program {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.
+                    if let Err(err) = self.rollback_pending_sequence_outer_tx(state) {
+                        capture_abort_error(
+                            &mut abort_error,
+                            err,
+                            "Failed to rollback saved outer transaction after sequence conflict",
+                        );
+                    }
                     self.rollback_current_txn(pager);
                     self.connection.set_changes(0);
                 }
@@ -2814,6 +2933,44 @@ impl Program {
         self.connection.rollback_current_txn_state(pager, true);
     }
 
+    /// MVCC sequence operations run in a separate inner tx, which temporarily
+    /// replaces the connection's `mv_tx` slot. If a transaction-level conflict
+    /// happens while that swap is active, the user transaction lives only in
+    /// `saved_outer`, not in `connection.mv_tx`. Roll it back here and clear
+    /// `saved_outer` so later statement cleanup cannot restore a transaction
+    /// that has already been aborted.
+    fn rollback_pending_sequence_outer_tx(&self, state: &mut ProgramState) -> Result<()> {
+        let Some(pending) = state.sequence_inner_tx_pending.as_mut() else {
+            return Ok(());
+        };
+        let db = pending.db;
+        let (outer_tx_id, _) = pending.saved_outer.take().ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence conflict rollback had pending inner transaction without saved outer \
+                 transaction"
+                    .to_string(),
+            )
+        })?;
+        let mv_store = self.connection.mv_store_for_db(db).ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence inner transaction has no MV store during conflict rollback".to_string(),
+            )
+        })?;
+        let pager = self.connection.get_pager_from_database_index(&db)?;
+        if !mv_store.is_tx_rollbackable(outer_tx_id) {
+            return Err(LimboError::InternalError(format!(
+                "saved sequence outer transaction {outer_tx_id} is not rollbackable during \
+                 conflict rollback"
+            )));
+        }
+        mv_store.rollback_tx(outer_tx_id, pager, &self.connection, db);
+        // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
+        // generic rollback then has no current tx to inspect, so it will not flip
+        // autocommit for us.
+        self.connection.auto_commit.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     pub fn is_trigger_subprogram(&self) -> bool {
         self.trigger.is_some() || self.is_subprogram
     }
@@ -2825,15 +2982,6 @@ impl Deref for Program {
     fn deref(&self) -> &PreparedProgram {
         &self.prepared
     }
-}
-
-pub(crate) fn make_record(
-    registers: &[Register],
-    start_reg: &usize,
-    count: &usize,
-) -> Result<ImmutableRecord> {
-    let regs = &registers[*start_reg..*start_reg + *count];
-    ImmutableRecord::from_registers(regs, regs.len())
 }
 
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
@@ -3161,18 +3309,11 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
+                let Ok(text_str) = simdutf8::basic::from_utf8(text_data) else {
+                    mark_unlikely();
+                    return Some(Err(LimboError::Corrupt(
+                        "TEXT value contains invalid UTF-8".into(),
+                    )));
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
@@ -3218,6 +3359,26 @@ mod tests {
     }
 
     #[test]
+    fn nth_into_register_rejects_invalid_utf8_text() {
+        let payload = [2, 15, 0xff];
+        let mut iterator = crate::types::ValueIterator::new(&payload).unwrap();
+        let mut destination = Register::Value(Value::Null);
+
+        let result = iterator
+            .nth_into_register(0, &mut destination)
+            .expect("record contains one value");
+
+        assert!(
+            matches!(
+                result,
+                Err(LimboError::Corrupt(ref message))
+                    if message == "TEXT value contains invalid UTF-8"
+            ),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[test]
     fn active_opcode_helpers_reject_mismatched_resumes() {
         let mut state = ProgramState::new(1, 0);
         *state.active_op_state.column() = OpColumnState::GetColumn;
@@ -3244,6 +3405,104 @@ mod tests {
             OpInsertSubState::Seek
         ));
         assert!(matches!(state.seek_state, OpSeekState::MoveLast));
+    }
+
+    #[test]
+    fn register_try_clone_copies_each_variant() {
+        let record_values = [Value::from_i64(1), Value::build_text("record payload")];
+        let aggregate_values = crate::alloc::vec![Value::build_text("aggregate payload")];
+        let registers = [
+            Register::Value(Value::build_text("value")),
+            Register::Aggregate(AggContext::Builtin(aggregate_values)),
+            Register::Record(
+                ImmutableRecord::from_values(&record_values, record_values.len()).unwrap(),
+            ),
+        ];
+
+        for source in registers {
+            assert_eq!(source.try_clone().unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn register_try_clone_from_reuses_matching_allocations() {
+        use crate::types::Text;
+
+        let src = Register::Value(Value::Text(Text::new(String::from("short"))));
+        let mut dst = Register::Value(Value::Text(Text::new(String::from(
+            "a destination string with plenty of capacity",
+        ))));
+        let ptr = match &dst {
+            Register::Value(Value::Text(t)) => t.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Register::Value(Value::Text(t)) => assert_eq!(t.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let src_values = [Value::from_i64(1), Value::build_text("record payload")];
+        let src =
+            Register::Record(ImmutableRecord::from_values(&src_values, src_values.len()).unwrap());
+        let large_values = [Value::build_text(
+            "a much longer record payload that dwarfs the source record",
+        )];
+        let mut dst = Register::Record(
+            ImmutableRecord::from_values(&large_values, large_values.len()).unwrap(),
+        );
+        let ptr = match &dst {
+            Register::Record(record) => record.get_payload().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Register::Record(record) => assert_eq!(record.get_payload().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let src = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
+            Value::build_text("agg state"),
+            Value::from_i64(2),
+        ]));
+        let mut dst = Register::Value(Value::Null);
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn register_take_buf_recycles_record_allocations() {
+        let values = [Value::build_text("some record payload")];
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let capacity = record.as_blob().capacity();
+        let ptr = record.get_payload().as_ptr();
+
+        let mut register = Register::Record(record);
+        let rebuilt = ImmutableRecord::build(&values, register.take_buf()).unwrap();
+        assert!(register.is_null());
+        assert_eq!(rebuilt.as_blob().capacity(), capacity);
+        assert_eq!(rebuilt.get_payload().as_ptr(), ptr);
+    }
+
+    #[test]
+    fn register_try_clone_value_from_reuses_value_slot() {
+        let value = Value::build_text(String::from("payload"));
+        let mut register = Register::Value(Value::build_text(String::from(
+            "existing buffer with plenty of capacity to reuse",
+        )));
+        let ptr = match &register {
+            Register::Value(Value::Text(text)) => text.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+
+        register.try_clone_value_from(&value).unwrap();
+        assert_eq!(register, Register::Value(value));
+        match &register {
+            Register::Value(Value::Text(text)) => assert_eq!(text.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
     }
 }
 

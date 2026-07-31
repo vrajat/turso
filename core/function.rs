@@ -520,7 +520,17 @@ impl WindowFunc {
     pub fn is_implemented(&self) -> bool {
         matches!(
             self,
-            Self::RowNumber | Self::Rank | Self::DenseRank | Self::FirstValue | Self::LastValue
+            Self::RowNumber
+                | Self::Rank
+                | Self::DenseRank
+                | Self::FirstValue
+                | Self::LastValue
+                | Self::NthValue
+                | Self::Lag
+                | Self::Lead
+                | Self::Ntile
+                | Self::PercentRank
+                | Self::CumeDist
         )
     }
 
@@ -534,6 +544,11 @@ impl WindowFunc {
         use crate::translate::plan::{Frame, FrameBoundary};
         use turso_parser::ast::{Expr, FrameMode, Literal};
         match self {
+            // Lag shares row_number's streaming frame even though its lookup
+            // can point forward (negative offset): SQLite emits a row as soon
+            // as the row after it is buffered, so a forward lookup past that
+            // one row misses and yields the default — behavior we match by
+            // using the same frame rather than caching the whole partition.
             Self::RowNumber | Self::Lag => Some(Frame {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::UnboundedPreceding,
@@ -570,72 +585,6 @@ impl WindowFunc {
             Self::External(_) => unreachable!(
                 "WindowFunc::External is not constructible: ExtFunc has no Window variant"
             ),
-        }
-    }
-
-    /// Whether the function produces a single value shared by every row in a
-    /// peer group (true) or a distinct value per row (false).
-    ///
-    /// This controls where `emit_aggregation_step` and
-    /// `emit_peer_group_flush` emit the function's `AggStep` and
-    /// `AggValue` opcodes:
-    ///
-    /// * true (rank-family): `AggStep` is emitted inside the input-scan loop
-    ///   in `emit_aggregation_step`, so it runs once for every row read from
-    ///   the subquery and advances the function's internal counter. `AggValue`
-    ///   is emitted once per peer-group flush in `emit_peer_group_flush`,
-    ///   before the loop over buffered rows, reading the accumulator into a
-    ///   result register. The loop then writes that one register's contents
-    ///   into the output for every buffered row in the group.
-    /// * false (row_number, ntile, lag, lead, nth_value): nothing is
-    ///   emitted in `emit_aggregation_step`. Both `AggStep` and `AggValue`
-    ///   are emitted inside the per-row loop in `emit_peer_group_flush`,
-    ///   so they run once per buffered row and produce a distinct value for
-    ///   each output row.
-    ///
-    /// Concrete example. Given `scores(name, score)`:
-    ///
-    ///   alice  100
-    ///   bob    100
-    ///   carol   90
-    ///
-    /// `rank() OVER (ORDER BY score DESC)` returns true — alice and bob are
-    /// peers on score=100 and share the same rank:
-    ///
-    ///   alice  100  1
-    ///   bob    100  1
-    ///   carol   90  3
-    ///
-    /// `row_number() OVER (ORDER BY score DESC)` returns false — every row
-    /// gets a distinct number even within the score=100 peer group:
-    ///
-    ///   alice  100  1
-    ///   bob    100  2
-    ///   carol   90  3
-    ///
-    /// Functions returning true: `rank`, `dense_rank`, `percent_rank`,
-    /// `cume_dist` — their value is determined entirely by where the peer
-    /// group sits in the partition's ordering — plus `first_value` and
-    /// `last_value`, whose default frame (`RANGE UNBOUNDED PRECEDING TO
-    /// CURRENT ROW`) ends at the current peer group, so every row in the
-    /// group sees the same frame contents.
-    /// Functions returning false: `row_number`, `ntile`, `lag`, `lead`,
-    /// `nth_value` — all depend on a row's position within the
-    /// partition/frame, not just its peer group.
-    pub fn one_value_per_peer_group(&self) -> bool {
-        match self {
-            Self::Rank
-            | Self::DenseRank
-            | Self::PercentRank
-            | Self::CumeDist
-            | Self::FirstValue
-            | Self::LastValue => true,
-            Self::RowNumber
-            | Self::Ntile
-            | Self::Lag
-            | Self::Lead
-            | Self::NthValue
-            | Self::External(_) => false,
         }
     }
 }
