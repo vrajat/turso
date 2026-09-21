@@ -1780,12 +1780,12 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::PgDbz => {
-                            if args.len() != 7 {
+                            if args.len() != 8 {
                                 crate::bail_parse_error!(
-                                    "pg_dbz() function must have exactly 7 arguments",
+                                    "pg_dbz() function must have exactly 8 arguments",
                                 );
                             }
-                            let start_reg = program.alloc_registers(7);
+                            let start_reg = program.alloc_registers(8);
                             for (i, arg) in args.iter().enumerate() {
                                 translate_expr(
                                     program,

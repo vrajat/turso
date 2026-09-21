@@ -10596,7 +10596,7 @@ pub fn op_function(
                 }
             }
             ScalarFunc::PgDbz => {
-                assert_eq!(arg_count, 7);
+                assert_eq!(arg_count, 8);
                 #[cfg(not(feature = "json"))]
                 {
                     return Err(LimboError::InvalidArgument(
@@ -10691,6 +10691,20 @@ pub fn op_function(
                             .into());
                         }
                     };
+                    let processing_time = match state.registers[*start_reg + 7].get_value() {
+                        Value::Numeric(Numeric::Integer(processing_time))
+                            if *processing_time >= 0 =>
+                        {
+                            Value::from_i64(*processing_time)
+                        }
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "pg_dbz: processing_time_ms must be a non-negative INTEGER"
+                                    .to_string(),
+                            )
+                            .into());
+                        }
+                    };
                     let source = json::json_object(vec![
                         Value::build_text("connector"),
                         Value::build_text("turso"),
@@ -10698,7 +10712,7 @@ pub fn op_function(
                         Value::build_text("main"),
                         Value::build_text("table"),
                         Value::build_text(table),
-                        Value::build_text("change_id"),
+                        Value::build_text("lsn"),
                         change_id,
                         Value::build_text("txId"),
                         transaction_id,
@@ -10715,7 +10729,7 @@ pub fn op_function(
                         Value::build_text("op"),
                         Value::build_text(operation),
                         Value::build_text("ts_ms"),
-                        change_time,
+                        processing_time,
                     ])?;
                     state.registers[*dest].set_value(envelope);
                 }
