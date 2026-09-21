@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
+use turso_core::LimboError;
 use turso_core::CDC_VERSION_CURRENT;
 
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
@@ -741,7 +742,22 @@ fn test_cdc_bin_record(db: TempDatabase) {
 }
 
 #[turso_macros::test]
-fn test_cdc_debezium_envelope(db: TempDatabase) {
+fn test_cdc_pg_dbz_matches_schema_less_debezium_value(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT pg_dbz(17, 123, 1, 'widgets', NULL, json_object('id', 42, 'name', 'widget', 'enabled', TRUE, 'note', NULL), 9)",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Value::Text(
+            r#"{"before":null,"after":{"id":42,"name":"widget","enabled":1,"note":null},"source":{"connector":"turso","db":"main","table":"widgets","change_id":17,"txId":9,"ts_ms":123000},"op":"c","ts_ms":123000}"#.to_string()
+        )]]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_pg_dbz_uses_debezium_operation_semantics(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -753,39 +769,69 @@ fn test_cdc_debezium_envelope(db: TempDatabase) {
     conn.execute("DELETE FROM t WHERE id = 1").unwrap();
     let rows = limbo_exec_rows(
         &conn,
-        "WITH events AS (SELECT pg_dbz(change_id, change_time, change_type, table_name, bin_record_json_object(table_columns_json_array(table_name), before), bin_record_json_object(table_columns_json_array(table_name), after), change_txn_id) AS event FROM turso_cdc WHERE table_name = 't') SELECT json_extract(event, '$.op'), json_extract(event, '$.before.name'), json_extract(event, '$.after.name'), json_extract(event, '$.source.connector'), json_extract(event, '$.source.table'), json_type(event, '$.source.change_id'), json_type(event, '$.ts_ms') FROM events",
+        "WITH events AS (SELECT pg_dbz(change_id, change_time, change_type, table_name, bin_record_json_object(table_columns_json_array(table_name), before), bin_record_json_object(table_columns_json_array(table_name), after), change_txn_id) AS event FROM turso_cdc WHERE table_name = 't') SELECT json_extract(event, '$.op'), json_type(event, '$.before'), json_type(event, '$.after'), json_extract(event, '$.before.name'), json_extract(event, '$.after.name'), json_extract(event, '$.source.connector'), json_extract(event, '$.source.db'), json_extract(event, '$.source.table'), json_type(event, '$.source.change_id'), json_type(event, '$.source.txId'), json_type(event, '$.source.ts_ms'), json_type(event, '$.ts_ms') FROM events",
     );
     assert_eq!(
         rows,
         vec![
             vec![
                 Value::Text("c".to_string()),
+                Value::Text("null".to_string()),
+                Value::Text("object".to_string()),
                 Value::Null,
                 Value::Text("alice".to_string()),
                 Value::Text("turso".to_string()),
+                Value::Text("main".to_string()),
                 Value::Text("t".to_string()),
+                Value::Text("integer".to_string()),
+                Value::Text("integer".to_string()),
                 Value::Text("integer".to_string()),
                 Value::Text("integer".to_string())
             ],
             vec![
                 Value::Text("u".to_string()),
+                Value::Text("object".to_string()),
+                Value::Text("object".to_string()),
                 Value::Text("alice".to_string()),
                 Value::Text("bob".to_string()),
                 Value::Text("turso".to_string()),
+                Value::Text("main".to_string()),
                 Value::Text("t".to_string()),
+                Value::Text("integer".to_string()),
+                Value::Text("integer".to_string()),
                 Value::Text("integer".to_string()),
                 Value::Text("integer".to_string())
             ],
             vec![
                 Value::Text("d".to_string()),
+                Value::Text("object".to_string()),
+                Value::Text("null".to_string()),
                 Value::Text("bob".to_string()),
                 Value::Null,
                 Value::Text("turso".to_string()),
+                Value::Text("main".to_string()),
                 Value::Text("t".to_string()),
+                Value::Text("integer".to_string()),
+                Value::Text("integer".to_string()),
                 Value::Text("integer".to_string()),
                 Value::Text("integer".to_string())
             ],
         ]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_pg_dbz_rejects_commit_records(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let err = limbo_exec_rows_fallible(
+        &db,
+        &conn,
+        "SELECT pg_dbz(17, 123, 2, 'widgets', NULL, json_object('id', 42), 9)",
+    )
+    .expect_err("pg_dbz must reject CDC COMMIT records");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref message) if message == "pg_dbz: change_type must be INSERT, UPDATE, or DELETE"),
+        "unexpected error: {err}"
     );
 }
 
