@@ -1177,6 +1177,24 @@ Each statement above runs in autocommit mode, so each one forms its own transact
 
 If you modify your table schema (adding/dropping columns), the `table_columns_json_array()` function returns the current schema, not the historical one. This can lead to incorrect results when decoding older CDC records. Manually track schema versions by storing the output of `table_columns_json_array()` before making schema changes.
 
+### Debezium envelope prototype
+
+`pg_dbz()` formats decoded CDC row changes as a JSON envelope with `before`, `after`, `source`, `op`, and `ts_ms` fields. It accepts INSERT, UPDATE, and DELETE records; pass decoded images from `bin_record_json_object()`. COMMIT records are transaction metadata and are not accepted.
+
+```sql
+SELECT pg_dbz(
+    change_id,
+    change_time,
+    change_type,
+    table_name,
+    bin_record_json_object(table_columns_json_array(table_name), before),
+    bin_record_json_object(table_columns_json_array(table_name), after),
+    change_txn_id
+)
+FROM turso_cdc
+WHERE change_type IN (-1, 0, 1);
+```
+
 ## Index Method (Experimental)
 
 `tursodb` allows developers to implement custom data access methods and integrate them seamlessly with the query planner. This feature is conceptually similar to [VTable](https://www.sqlite.org/vtab.html) but provides greater flexibility and automatic query planner integration. The feature is experimental and currently gated behind the `--experimental-index-method` flag.

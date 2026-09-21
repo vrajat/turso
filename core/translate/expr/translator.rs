@@ -1779,6 +1779,30 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
+                        ScalarFunc::PgDbz => {
+                            if args.len() != 7 {
+                                crate::bail_parse_error!(
+                                    "pg_dbz() function must have exactly 7 arguments",
+                                );
+                            }
+                            let start_reg = program.alloc_registers(7);
+                            for (i, arg) in args.iter().enumerate() {
+                                translate_expr(
+                                    program,
+                                    referenced_tables,
+                                    arg,
+                                    start_reg + i,
+                                    resolver,
+                                )?;
+                            }
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
+                            Ok(target_register)
+                        }
                         ScalarFunc::Attach => {
                             // ATTACH is handled by the attach.rs module, not here
                             crate::bail_parse_error!(

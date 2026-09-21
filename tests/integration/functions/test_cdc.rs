@@ -740,6 +740,55 @@ fn test_cdc_bin_record(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test]
+fn test_cdc_debezium_envelope(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'alice')").unwrap();
+    conn.execute("UPDATE t SET name = 'bob' WHERE id = 1")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "WITH events AS (SELECT pg_dbz(change_id, change_time, change_type, table_name, bin_record_json_object(table_columns_json_array(table_name), before), bin_record_json_object(table_columns_json_array(table_name), after), change_txn_id) AS event FROM turso_cdc WHERE table_name = 't') SELECT json_extract(event, '$.op'), json_extract(event, '$.before.name'), json_extract(event, '$.after.name'), json_extract(event, '$.source.connector'), json_extract(event, '$.source.table'), json_type(event, '$.source.change_id'), json_type(event, '$.ts_ms') FROM events",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Text("c".to_string()),
+                Value::Null,
+                Value::Text("alice".to_string()),
+                Value::Text("turso".to_string()),
+                Value::Text("t".to_string()),
+                Value::Text("integer".to_string()),
+                Value::Text("integer".to_string())
+            ],
+            vec![
+                Value::Text("u".to_string()),
+                Value::Text("alice".to_string()),
+                Value::Text("bob".to_string()),
+                Value::Text("turso".to_string()),
+                Value::Text("t".to_string()),
+                Value::Text("integer".to_string()),
+                Value::Text("integer".to_string())
+            ],
+            vec![
+                Value::Text("d".to_string()),
+                Value::Text("bob".to_string()),
+                Value::Null,
+                Value::Text("turso".to_string()),
+                Value::Text("t".to_string()),
+                Value::Text("integer".to_string()),
+                Value::Text("integer".to_string())
+            ],
+        ]
+    );
+}
+
 // TODO: cannot use mvcc because of indexes
 #[turso_macros::test()]
 fn test_cdc_schema_changes(db: TempDatabase) {

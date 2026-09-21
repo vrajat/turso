@@ -850,6 +850,7 @@ pub enum ScalarFunc {
     Likelihood,
     TableColumnsJsonArray,
     BinRecordJsonObject,
+    PgDbz,
     Attach,
     Detach,
     Unlikely,
@@ -986,6 +987,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Likelihood => true,
             ScalarFunc::TableColumnsJsonArray => true, // while columns of the table can change with DDL statements, within single query plan it's static
             ScalarFunc::BinRecordJsonObject => true,
+            ScalarFunc::PgDbz => true,
             ScalarFunc::Attach => false, // changes database state
             ScalarFunc::Detach => false, // changes database state
             ScalarFunc::Unlikely => true,
@@ -1134,6 +1136,7 @@ impl Display for ScalarFunc {
             Self::Likelihood => "likelihood",
             Self::TableColumnsJsonArray => "table_columns_json_array",
             Self::BinRecordJsonObject => "bin_record_json_object",
+            Self::PgDbz => "pg_dbz",
             Self::Attach => "attach",
             Self::Detach => "detach",
             Self::Unlikely => "unlikely",
@@ -1214,6 +1217,7 @@ impl ScalarFunc {
                 | Self::Detach
                 | Self::TableColumnsJsonArray
                 | Self::BinRecordJsonObject
+                | Self::PgDbz
                 | Self::ConnTxnId
                 | Self::IsAutocommit
         )
@@ -1292,6 +1296,7 @@ impl ScalarFunc {
             | Self::Detach
             | Self::TableColumnsJsonArray
             | Self::BinRecordJsonObject
+            | Self::PgDbz
             | Self::ConnTxnId
             | Self::IsAutocommit => &[0],
             // Scalar max/min (multi-arg)
