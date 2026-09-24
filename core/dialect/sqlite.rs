@@ -157,6 +157,7 @@ pub fn register_builtin_catalog(
     {
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_each())?;
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_tree())?;
+        schema.register_sql_table_function("pg_dbz", crate::pg_dbz::expand);
     }
     #[cfg(feature = "cli_only")]
     {

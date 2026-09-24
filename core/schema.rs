@@ -715,9 +715,12 @@ pub enum SchemaObjectType {
     Index,
 }
 
+pub(crate) type SqlTableFunction = fn(&[Box<ast::Expr>]) -> crate::Result<ast::Select>;
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
+    sql_table_functions: HashMap<String, SqlTableFunction>,
     #[cfg(feature = "conn_raw_api")]
     pub(crate) table_names_by_root_page: HashMap<i64, String>,
 
@@ -887,6 +890,7 @@ impl Schema {
         }
         let mut schema = Self {
             tables,
+            sql_table_functions: HashMap::default(),
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page,
             materialized_view_names,
@@ -929,6 +933,17 @@ impl Schema {
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
         );
         Ok(name)
+    }
+
+    pub(crate) fn register_sql_table_function(&mut self, name: &str, expand: SqlTableFunction) {
+        self.sql_table_functions
+            .insert(normalize_ident(name), expand);
+    }
+
+    pub(crate) fn get_sql_table_function(&self, name: &str) -> Option<SqlTableFunction> {
+        self.sql_table_functions
+            .get(&normalize_ident(name))
+            .copied()
     }
 
     /// Look up a custom type definition by name.
@@ -2816,6 +2831,7 @@ impl TryClone for Schema {
         let incompatible_views = self.incompatible_views.try_clone()?;
         Ok(Self {
             tables,
+            sql_table_functions: self.sql_table_functions.try_clone()?,
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page: self.table_names_by_root_page.try_clone()?,
             materialized_view_names,

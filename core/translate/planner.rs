@@ -1583,6 +1583,7 @@ fn parse_from_clause_table(
             maybe_alias.as_ref(),
             &[],
             indexed,
+            false,
             connection,
         ),
         ast::SelectTable::Select(subselect, maybe_alias) => {
@@ -1666,7 +1667,8 @@ fn parse_from_clause_table(
             &qualified_name,
             maybe_alias.as_ref(),
             &args,
-            None, // table-valued functions don't support INDEXED BY
+            None,
+            true,
             connection,
         ),
         ast::SelectTable::Sub(..) => {
@@ -1686,6 +1688,7 @@ fn parse_table(
     maybe_alias: Option<&As>,
     args: &[Box<Expr>],
     indexed: Option<ast::Indexed>,
+    called_as_function: bool,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
@@ -1832,6 +1835,30 @@ fn parse_table(
 
     // Resolve table using connection's with_schema method
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+    let sql_table_function = (called_as_function && qualified_name.db_name.is_none())
+        .then(|| {
+            resolver.with_schema(database_id, |schema| {
+                schema.get_sql_table_function(table_name.as_str())
+            })
+        })
+        .flatten();
+
+    if !matches!(table.as_deref(), Some(Table::Virtual(_))) {
+        if let Some(expand) = sql_table_function {
+            let alias = maybe_alias
+                .cloned()
+                .or_else(|| Some(ast::As::As(table_name.clone())));
+            return parse_from_clause_table(
+                ast::SelectTable::Select(expand(args)?, alias),
+                resolver,
+                program,
+                table_references,
+                vtab_predicates,
+                cte_definitions,
+                connection,
+            );
+        }
+    }
 
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
