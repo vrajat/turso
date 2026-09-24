@@ -1779,10 +1779,10 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        ScalarFunc::PgDbz => {
+                        ScalarFunc::PgDbzEvent => {
                             if args.len() != 8 {
                                 crate::bail_parse_error!(
-                                    "pg_dbz() function must have exactly 8 arguments",
+                                    "pg_dbz_event() function must have exactly 8 arguments",
                                 );
                             }
                             let start_reg = program.alloc_registers(8);

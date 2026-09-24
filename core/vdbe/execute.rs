@@ -10595,12 +10595,12 @@ pub fn op_function(
                     )?);
                 }
             }
-            ScalarFunc::PgDbz => {
+            ScalarFunc::PgDbzEvent => {
                 assert_eq!(arg_count, 8);
                 #[cfg(not(feature = "json"))]
                 {
                     return Err(LimboError::InvalidArgument(
-                        "pg_dbz: turso must be compiled with JSON support".to_string(),
+                        "pg_dbz_event: turso must be compiled with JSON support".to_string(),
                     )
                     .into());
                 }
@@ -10612,7 +10612,8 @@ pub fn op_function(
                         }
                         _ => {
                             return Err(LimboError::InvalidArgument(
-                                "pg_dbz: change_id must be a non-negative INTEGER".to_string(),
+                                "pg_dbz_event: change_id must be a non-negative INTEGER"
+                                    .to_string(),
                             )
                             .into());
                         }
@@ -10621,13 +10622,13 @@ pub fn op_function(
                         Value::Numeric(Numeric::Integer(change_time)) => {
                             Value::from_i64(change_time.checked_mul(1000).ok_or_else(|| {
                                 LimboError::InvalidArgument(
-                                    "pg_dbz: change_time is out of range".to_string(),
+                                    "pg_dbz_event: change_time is out of range".to_string(),
                                 )
                             })?)
                         }
                         _ => {
                             return Err(LimboError::InvalidArgument(
-                                "pg_dbz: change_time must be an INTEGER".to_string(),
+                                "pg_dbz_event: change_time must be an INTEGER".to_string(),
                             )
                             .into());
                         }
@@ -10638,7 +10639,8 @@ pub fn op_function(
                         Value::Numeric(Numeric::Integer(-1)) => "d",
                         _ => {
                             return Err(LimboError::InvalidArgument(
-                                "pg_dbz: change_type must be INSERT, UPDATE, or DELETE".to_string(),
+                                "pg_dbz_event: change_type must be INSERT, UPDATE, or DELETE"
+                                    .to_string(),
                             )
                             .into());
                         }
@@ -10647,7 +10649,7 @@ pub fn op_function(
                         Value::Text(table) => table.as_str().to_string(),
                         _ => {
                             return Err(LimboError::InvalidArgument(
-                                "pg_dbz: table_name must be TEXT".to_string(),
+                                "pg_dbz_event: table_name must be TEXT".to_string(),
                             )
                             .into());
                         }
@@ -10661,7 +10663,7 @@ pub fn op_function(
                         }
                         _ => {
                             return Err(LimboError::InvalidArgument(
-                                "pg_dbz: before must be JSON or NULL".to_string(),
+                                "pg_dbz_event: before must be JSON or NULL".to_string(),
                             )
                             .into());
                         }
@@ -10675,7 +10677,7 @@ pub fn op_function(
                         }
                         _ => {
                             return Err(LimboError::InvalidArgument(
-                                "pg_dbz: after must be JSON or NULL".to_string(),
+                                "pg_dbz_event: after must be JSON or NULL".to_string(),
                             )
                             .into());
                         }
@@ -10686,7 +10688,7 @@ pub fn op_function(
                         }
                         _ => {
                             return Err(LimboError::InvalidArgument(
-                                "pg_dbz: change_txn_id must be an INTEGER".to_string(),
+                                "pg_dbz_event: change_txn_id must be an INTEGER".to_string(),
                             )
                             .into());
                         }
@@ -10699,7 +10701,7 @@ pub fn op_function(
                         }
                         _ => {
                             return Err(LimboError::InvalidArgument(
-                                "pg_dbz: processing_time_ms must be a non-negative INTEGER"
+                                "pg_dbz_event: processing_time_ms must be a non-negative INTEGER"
                                     .to_string(),
                             )
                             .into());

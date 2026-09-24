@@ -1179,7 +1179,7 @@ If you modify your table schema (adding/dropping columns), the `table_columns_js
 
 ### Debezium envelope prototype
 
-`pg_dbz()` formats decoded CDC row changes as a schema-less Debezium JSON envelope. It accepts INSERT, UPDATE, and DELETE records; pass decoded images from `bin_record_json_object()`. COMMIT records are transaction metadata and are not accepted.
+`pg_dbz_event()` formats decoded CDC row changes as a schema-less Debezium JSON envelope. It accepts INSERT, UPDATE, and DELETE records; pass decoded images from `bin_record_json_object()`. COMMIT records are transaction metadata and are not accepted.
 
 The common Debezium fields have these Turso meanings:
 
@@ -1197,10 +1197,10 @@ The common Debezium fields have these Turso meanings:
 | `ts_us`, `ts_ns` | No | Turso CDC currently records source time in seconds. False precision is not added. |
 | `transaction` | No | `source.txId` is available, but total and per-table event ordering are not calculated. |
 
-PostgreSQL-specific fields such as `xmin` and PostgreSQL schema names are not emitted. A Debezium record key is separate from the envelope value; `pg_dbz()` does not create one. Turso's CDC `id` is a rowid where supported, while `source.lsn` is the event cursor.
+PostgreSQL-specific fields such as `xmin` and PostgreSQL schema names are not emitted. A Debezium record key is separate from the envelope value; `pg_dbz_event()` does not create one. Turso's CDC `id` is a rowid where supported, while `source.lsn` is the event cursor.
 
 ```sql
-SELECT pg_dbz(
+SELECT pg_dbz_event(
     change_id,
     change_time,
     change_type,
