@@ -457,6 +457,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "soundex" => Ok(Some(Func::Scalar(ScalarFunc::Soundex))),
         "table_columns_json_array" => Ok(Some(Func::Scalar(ScalarFunc::TableColumnsJsonArray))),
         "bin_record_json_object" => Ok(Some(Func::Scalar(ScalarFunc::BinRecordJsonObject))),
+        "pg_dbz_event" => Ok(Some(Func::Scalar(ScalarFunc::PgDbzEvent))),
         "conn_txn_id" => Ok(Some(Func::Scalar(ScalarFunc::ConnTxnId))),
         "is_autocommit" => Ok(Some(Func::Scalar(ScalarFunc::IsAutocommit))),
         "sequence_watermark_experimental" => Ok(Some(Func::Scalar(ScalarFunc::SequenceWatermark))),

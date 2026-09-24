@@ -1177,6 +1177,43 @@ Each statement above runs in autocommit mode, so each one forms its own transact
 
 If you modify your table schema (adding/dropping columns), the `table_columns_json_array()` function returns the current schema, not the historical one. This can lead to incorrect results when decoding older CDC records. Manually track schema versions by storing the output of `table_columns_json_array()` before making schema changes.
 
+### Debezium envelope prototype
+
+`pg_dbz_event()` formats decoded CDC row changes as a schema-less Debezium JSON envelope. It accepts INSERT, UPDATE, and DELETE records; pass decoded images from `bin_record_json_object()`. COMMIT records are transaction metadata and are not accepted.
+
+The common Debezium fields have these Turso meanings:
+
+| Field | Compatibility | Meaning |
+| --- | --- | --- |
+| `before`, `after` | Yes | Row images with Debezium create, update, and delete semantics when supplied. `before` can be null for an update, as it can with Debezium. |
+| `op` | Yes | `c`, `u`, or `d`. Snapshot reads and truncates are not supported. |
+| `source.connector` | Yes | `turso`. |
+| `source.db`, `source.table` | Yes | The SQLite database and changed table. |
+| `source.lsn` | Yes | The numeric `change_id`, used as the durable event cursor. It is not the changed row's rowid. |
+| `source.txId` | Yes | Groups changes from the same transaction. |
+| `source.ts_ms` | Partial | The capture time in milliseconds. Unlike PostgreSQL commit time, it can be earlier than commit for a long transaction. |
+| `source.version`, `source.name`, `source.snapshot` | No | The SQL formatter has no connector deployment or snapshot context. |
+| `ts_ms` | Yes | The time at which the caller processed the event, supplied as `processing_time_ms`. |
+| `ts_us`, `ts_ns` | No | Turso CDC currently records source time in seconds. False precision is not added. |
+| `transaction` | No | `source.txId` is available, but total and per-table event ordering are not calculated. |
+
+PostgreSQL-specific fields such as `xmin` and PostgreSQL schema names are not emitted. A Debezium record key is separate from the envelope value; `pg_dbz_event()` does not create one. Turso's CDC `id` is a rowid where supported, while `source.lsn` is the event cursor.
+
+```sql
+SELECT pg_dbz_event(
+    change_id,
+    change_time,
+    change_type,
+    table_name,
+    bin_record_json_object(table_columns_json_array(table_name), before),
+    bin_record_json_object(table_columns_json_array(table_name), after),
+    change_txn_id,
+    unixepoch() * 1000
+)
+FROM turso_cdc
+WHERE change_type IN (-1, 0, 1);
+```
+
 ## Index Method (Experimental)
 
 `tursodb` allows developers to implement custom data access methods and integrate them seamlessly with the query planner. This feature is conceptually similar to [VTable](https://www.sqlite.org/vtab.html) but provides greater flexibility and automatic query planner integration. The feature is experimental and currently gated behind the `--experimental-index-method` flag.

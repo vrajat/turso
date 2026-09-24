@@ -10595,6 +10595,147 @@ pub fn op_function(
                     )?);
                 }
             }
+            ScalarFunc::PgDbzEvent => {
+                assert_eq!(arg_count, 8);
+                #[cfg(not(feature = "json"))]
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "pg_dbz_event: turso must be compiled with JSON support".to_string(),
+                    )
+                    .into());
+                }
+                #[cfg(feature = "json")]
+                {
+                    let change_id = match state.registers[*start_reg].get_value() {
+                        Value::Numeric(Numeric::Integer(change_id)) if *change_id >= 0 => {
+                            Value::from_i64(*change_id)
+                        }
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "pg_dbz_event: change_id must be a non-negative INTEGER"
+                                    .to_string(),
+                            )
+                            .into());
+                        }
+                    };
+                    let change_time = match state.registers[*start_reg + 1].get_value() {
+                        Value::Numeric(Numeric::Integer(change_time)) => {
+                            Value::from_i64(change_time.checked_mul(1000).ok_or_else(|| {
+                                LimboError::InvalidArgument(
+                                    "pg_dbz_event: change_time is out of range".to_string(),
+                                )
+                            })?)
+                        }
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "pg_dbz_event: change_time must be an INTEGER".to_string(),
+                            )
+                            .into());
+                        }
+                    };
+                    let operation = match state.registers[*start_reg + 2].get_value() {
+                        Value::Numeric(Numeric::Integer(1)) => "c",
+                        Value::Numeric(Numeric::Integer(0)) => "u",
+                        Value::Numeric(Numeric::Integer(-1)) => "d",
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "pg_dbz_event: change_type must be INSERT, UPDATE, or DELETE"
+                                    .to_string(),
+                            )
+                            .into());
+                        }
+                    };
+                    let table = match state.registers[*start_reg + 3].get_value() {
+                        Value::Text(table) => table.as_str().to_string(),
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "pg_dbz_event: table_name must be TEXT".to_string(),
+                            )
+                            .into());
+                        }
+                    };
+                    let before = match state.registers[*start_reg + 4].get_value() {
+                        Value::Null => Value::Null,
+                        Value::Text(value)
+                            if matches!(value.subtype, crate::types::TextSubtype::Json) =>
+                        {
+                            Value::Text(value.clone())
+                        }
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "pg_dbz_event: before must be JSON or NULL".to_string(),
+                            )
+                            .into());
+                        }
+                    };
+                    let after = match state.registers[*start_reg + 5].get_value() {
+                        Value::Null => Value::Null,
+                        Value::Text(value)
+                            if matches!(value.subtype, crate::types::TextSubtype::Json) =>
+                        {
+                            Value::Text(value.clone())
+                        }
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "pg_dbz_event: after must be JSON or NULL".to_string(),
+                            )
+                            .into());
+                        }
+                    };
+                    let transaction_id = match state.registers[*start_reg + 6].get_value() {
+                        Value::Numeric(Numeric::Integer(transaction_id)) => {
+                            Value::from_i64(*transaction_id)
+                        }
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "pg_dbz_event: change_txn_id must be an INTEGER".to_string(),
+                            )
+                            .into());
+                        }
+                    };
+                    let processing_time = match state.registers[*start_reg + 7].get_value() {
+                        Value::Numeric(Numeric::Integer(processing_time))
+                            if *processing_time >= 0 =>
+                        {
+                            Value::from_i64(*processing_time)
+                        }
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "pg_dbz_event: processing_time_ms must be a non-negative INTEGER"
+                                    .to_string(),
+                            )
+                            .into());
+                        }
+                    };
+                    let source = json::json_object(vec![
+                        Value::build_text("connector"),
+                        Value::build_text("turso"),
+                        Value::build_text("db"),
+                        Value::build_text("main"),
+                        Value::build_text("table"),
+                        Value::build_text(table),
+                        Value::build_text("lsn"),
+                        change_id,
+                        Value::build_text("txId"),
+                        transaction_id,
+                        Value::build_text("ts_ms"),
+                        change_time.clone(),
+                    ])?;
+                    let envelope = json::json_object(vec![
+                        Value::build_text("before"),
+                        before,
+                        Value::build_text("after"),
+                        after,
+                        Value::build_text("source"),
+                        source,
+                        Value::build_text("op"),
+                        Value::build_text(operation),
+                        Value::build_text("ts_ms"),
+                        processing_time,
+                    ])?;
+                    state.registers[*dest].set_value(envelope);
+                }
+            }
             ScalarFunc::Attach => {
                 assert_eq!(arg_count, 3);
                 let filename = state.registers[*start_reg].get_value();

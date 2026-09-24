@@ -1,0 +1,73 @@
+@database :memory:
+
+test pg-dbz-event-envelope {
+    SELECT pg_dbz_event(
+        17,
+        123,
+        1,
+        'widgets',
+        NULL,
+        json_object('id', 42, 'name', 'widget', 'enabled', TRUE, 'note', NULL),
+        9,
+        456789
+    );
+}
+expect {
+    {"before":null,"after":{"id":42,"name":"widget","enabled":1,"note":null},"source":{"connector":"turso","db":"main","table":"widgets","lsn":17,"txId":9,"ts_ms":123000},"op":"c","ts_ms":456789}
+}
+
+test pg-dbz-event-before-after {
+    WITH events(event) AS (
+        VALUES
+            (pg_dbz_event(10, 100, 1, 'people', NULL, json_object('name', 'alice'), 7, 100001)),
+            (pg_dbz_event(11, 100, 0, 'people', json_object('name', 'alice'), json_object('name', 'bob'), 7, 100002)),
+            (pg_dbz_event(12, 100, 0, 'people', NULL, json_object('name', 'carol'), 7, 100003)),
+            (pg_dbz_event(13, 100, -1, 'people', json_object('name', 'carol'), NULL, 7, 100004)),
+            (pg_dbz_event(14, 100, -1, 'people', NULL, NULL, 7, 100005))
+    )
+    SELECT
+        json_extract(event, '$.op'),
+        json_type(event, '$.before'),
+        json_type(event, '$.after'),
+        json_extract(event, '$.before.name'),
+        json_extract(event, '$.after.name')
+    FROM events;
+}
+expect {
+    c|null|object||alice
+    u|object|object|alice|bob
+    u|null|object||carol
+    d|object|null|carol|
+    d|null|null||
+}
+
+test pg-dbz-event-source-fields {
+    WITH event(value) AS (
+        VALUES (pg_dbz_event(17, 123, 0, 'widgets', json_object('id', 42), json_object('id', 42), 9, 456789))
+    )
+    SELECT
+        json_extract(value, '$.source.lsn'),
+        json_extract(value, '$.source.txId'),
+        json_extract(value, '$.source.ts_ms'),
+        json_extract(value, '$.ts_ms'),
+        json_extract(value, '$.source.table'),
+        json_extract(value, '$.source.connector')
+    FROM event;
+}
+expect {
+    17|9|123000|456789|widgets|turso
+}
+
+test pg-dbz-event-rejects-commit {
+    SELECT pg_dbz_event(17, 123, 2, 'widgets', NULL, json_object('id', 42), 9, 456789);
+}
+expect error {
+    pg_dbz_event: change_type must be INSERT, UPDATE, or DELETE
+}
+
+test pg-dbz-event-requires-eight-arguments {
+    SELECT pg_dbz_event(17);
+}
+expect error {
+    function must have exactly 8 arguments
+}
