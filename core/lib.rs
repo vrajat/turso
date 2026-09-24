@@ -68,6 +68,7 @@ mod numeric;
 mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
+mod pg_dbz;
 mod pragma;
 mod progress;
 mod pseudo;

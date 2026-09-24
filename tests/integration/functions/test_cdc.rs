@@ -740,6 +740,27 @@ fn test_cdc_bin_record(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test]
+fn test_pg_dbz_accepts_bound_cursor(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO people VALUES (1, 'alice')")
+        .unwrap();
+    let mut statement = conn
+        .prepare("SELECT lsn FROM pg_dbz(?) ORDER BY lsn")
+        .unwrap();
+    statement
+        .bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(1))
+        .unwrap();
+    assert_eq!(
+        statement.run_collect_rows().unwrap(),
+        vec![vec![turso_core::Value::from_i64(3)]]
+    );
+}
+
 // TODO: cannot use mvcc because of indexes
 #[turso_macros::test()]
 fn test_cdc_schema_changes(db: TempDatabase) {

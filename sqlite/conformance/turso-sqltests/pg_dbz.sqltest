@@ -1,0 +1,73 @@
+@database :memory:
+
+setup cdc-stream {
+    PRAGMA capture_data_changes_conn('full');
+    CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO people VALUES (1, 'alice');
+    UPDATE people SET name = 'bob' WHERE id = 1;
+    DELETE FROM people WHERE id = 1;
+}
+
+@setup cdc-stream
+test pg-dbz-stream {
+    SELECT
+        lsn,
+        json_extract(event, '$.source.lsn'),
+        json_extract(event, '$.op'),
+        json_extract(event, '$.before.name'),
+        json_extract(event, '$.after.name'),
+        typeof(json_extract(event, '$.ts_ms'))
+    FROM pg_dbz(0)
+    ORDER BY lsn;
+}
+expect {
+    3|3|c||alice|integer
+    5|5|u|alice|bob|integer
+    7|7|d|bob||integer
+}
+
+@setup cdc-stream
+test pg-dbz-resume-after-lsn {
+    SELECT lsn FROM pg_dbz(3) ORDER BY lsn;
+}
+expect {
+    5
+    7
+}
+
+@setup cdc-stream
+test pg-dbz-cursor-expression {
+    SELECT lsn FROM pg_dbz(1 + 2) ORDER BY lsn;
+}
+expect {
+    5
+    7
+}
+
+@setup cdc-stream
+test pg-dbz-limit {
+    SELECT lsn FROM pg_dbz(0) LIMIT 2;
+}
+expect {
+    3
+    5
+}
+
+@setup cdc-stream
+test pg-dbz-caught-up {
+    SELECT lsn FROM pg_dbz(7);
+}
+expect {
+}
+
+test pg-dbz-table-name-does-not-conflict {
+    PRAGMA capture_data_changes_conn('full');
+    CREATE TABLE pg_dbz(value TEXT);
+    INSERT INTO pg_dbz VALUES ('table row');
+    SELECT value FROM pg_dbz;
+    SELECT lsn, json_extract(event, '$.source.table') FROM pg_dbz(0);
+}
+expect {
+    table row
+    3|pg_dbz
+}
